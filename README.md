@@ -181,6 +181,7 @@ subagent({
 | `systemPrompt` | string | — | Append to system prompt |
 | `skills` | string | — | Comma-separated skill names |
 | `tools` | string | — | Comma-separated tool names |
+| `cwd` | string | — | Working directory for the sub-agent (see [Role Folders](#role-folders)) |
 
 ---
 
@@ -247,6 +248,7 @@ description: Does something specific
 model: anthropic/claude-sonnet-4-6
 thinking: minimal
 tools: read, bash, edit, write
+spawning: false
 ---
 
 # My Agent
@@ -255,6 +257,162 @@ You are a specialized agent that does X...
 ```
 
 The frontmatter configures the agent defaults. The body becomes the system prompt.
+
+### Frontmatter Reference
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Agent name (used in `agent: "my-agent"`) |
+| `description` | string | Shown in `subagents_list` output |
+| `model` | string | Default model (e.g. `anthropic/claude-sonnet-4-6`) |
+| `thinking` | string | Thinking level: `minimal`, `medium`, `high` |
+| `tools` | string | Comma-separated builtin tools (e.g. `read, bash, edit, write`) |
+| `skills` | string | Comma-separated skill names to auto-load |
+| `spawning` | boolean | Set `false` to deny all subagent-spawning tools |
+| `deny-tools` | string | Comma-separated extension tool names to deny |
+| `cwd` | string | Default working directory (absolute or relative to project root) |
+
+---
+
+## Tool Access Control
+
+By default, every sub-agent has access to all extension tools — including the ability to spawn further sub-agents. This can lead to unbounded recursion and wasted tokens (a researcher spawning another researcher, a worker spawning workers, etc.).
+
+Two frontmatter fields control which tools are available in a sub-agent session:
+
+### `spawning: false`
+
+Shorthand that denies all four spawning tools at once:
+- `subagent`
+- `parallel_subagents`
+- `subagents_list`
+- `subagent_resume`
+
+```yaml
+---
+name: worker
+spawning: false
+---
+```
+
+The agent can still do its work — it just can't spawn other agents.
+
+### `deny-tools`
+
+Fine-grained control over individual tools. Comma-separated list of extension tool names to deny:
+
+```yaml
+---
+name: focused-agent
+deny-tools: subagent, parallel_subagents, set_tab_title
+---
+```
+
+### Combining Both
+
+Both fields can be used together. The denied sets are merged:
+
+```yaml
+---
+name: locked-down-agent
+spawning: false
+deny-tools: set_tab_title
+---
+# Denies: subagent, parallel_subagents, subagents_list, subagent_resume, set_tab_title
+```
+
+### How It Works
+
+When a sub-agent is spawned, the extension resolves the denied tools from the agent's frontmatter and passes them as a `PI_DENY_TOOLS` environment variable to the child process. The extension checks this variable at startup and skips registering the denied tools — they never appear in the agent's tool list.
+
+### Recommended Configuration
+
+| Agent | `spawning` | Rationale |
+|-------|-----------|-----------|
+| planner | *(default)* | Legitimately spawns scouts for investigation |
+| worker | `false` | Should implement tasks, not delegate |
+| researcher | `false` | Should research, not spawn |
+| reviewer | `false` | Should review, not spawn |
+| scout | `false` | Should gather context, not spawn |
+
+---
+
+## Role Folders
+
+The `cwd` parameter lets sub-agents start in a specific directory. When pi launches in a folder, it auto-discovers that folder's local configuration:
+
+- `.pi/agents/` — local agent definitions
+- `CLAUDE.md`, `.cursorrules`, etc. — project conventions / system prompt
+- `.pi/skills/` — local skills
+- `.pi/extensions/` — local extensions
+
+This makes it possible to create **role-specific folders** where each folder defines a completely different agent persona — with its own system prompt, tools, skills, and conventions.
+
+### Example: Game Design Team
+
+```
+project/
+├── agents/
+│   ├── game-designer/
+│   │   └── CLAUDE.md          ← "You are a game designer..."
+│   ├── sre/
+│   │   ├── CLAUDE.md          ← "You are an SRE specialist..."
+│   │   └── .pi/
+│   │       └── skills/
+│   │           └── runbooks/  ← SRE-specific skills
+│   └── narrative/
+│       └── CLAUDE.md          ← "You are a narrative designer..."
+```
+
+Spawn them:
+
+```typescript
+// Game designer — picks up agents/game-designer/CLAUDE.md
+subagent({
+  name: "Game Designer",
+  interactive: true,
+  cwd: "agents/game-designer",
+  task: "Help me design the combat system"
+})
+
+// SRE — picks up agents/sre/CLAUDE.md + local skills
+subagent({
+  name: "SRE",
+  interactive: false,
+  cwd: "agents/sre",
+  task: "Review our deployment pipeline for single points of failure"
+})
+```
+
+### `cwd` in Agent Definitions
+
+You can also set a default `cwd` in the agent frontmatter, so every time that agent is spawned it starts in the right folder:
+
+```yaml
+---
+name: game-designer
+description: Game design specialist
+model: anthropic/claude-sonnet-4-6
+tools: read, write
+cwd: ./agents/game-designer
+spawning: false
+---
+
+You are a game designer...
+```
+
+Then simply:
+
+```typescript
+subagent({ name: "Game Designer", agent: "game-designer", task: "..." })
+// Automatically starts in ./agents/game-designer/
+```
+
+The `cwd` parameter on the tool call always overrides the agent default.
+
+### How It Works
+
+The `cwd` is resolved relative to the project root (or used as-is if absolute). Before launching the pi process, the extension prepends `cd <resolved-path> &&` to the command. Pi then starts in that directory and discovers its local configuration normally.
 
 ---
 

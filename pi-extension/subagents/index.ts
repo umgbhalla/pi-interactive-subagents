@@ -38,6 +38,7 @@ const SubagentParams = Type.Object({
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
   skills: Type.Optional(Type.String({ description: "Comma-separated skills (overrides agent default)" })),
   tools: Type.Optional(Type.String({ description: "Comma-separated tools (overrides agent default)" })),
+  cwd: Type.Optional(Type.String({ description: "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders." })),
   fork: Type.Optional(Type.Boolean({ description: "Fork the current session — sub-agent gets full conversation context. Use for iterate/bugfix patterns." })),
 });
 
@@ -48,6 +49,7 @@ interface AgentDefaults {
   thinking?: string;
   denyTools?: string;
   spawning?: boolean;
+  cwd?: string;
   body?: string;
 }
 
@@ -104,6 +106,7 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
       thinking: get("thinking"),
       denyTools: get("deny-tools"),
       spawning: spawningRaw != null ? spawningRaw === "true" : undefined,
+      cwd: get("cwd"),
       body: body || undefined,
     };
   }
@@ -333,7 +336,14 @@ async function runSubagent(
     writeFileSync(artifactPath, fullTask, "utf8");
     parts.push(`@${artifactPath}`);
 
-    const piCommand = envPrefix + parts.join(" ");
+    // Resolve cwd — param overrides agent default, supports absolute and relative paths
+    const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
+    const effectiveCwd = rawCwd
+      ? (rawCwd.startsWith("/") ? rawCwd : join(process.cwd(), rawCwd))
+      : null;
+    const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
+
+    const piCommand = cdPrefix + envPrefix + parts.join(" ");
     const command = `${piCommand}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
     sendCommand(surface, command);
 
@@ -530,11 +540,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const icon = interactive ? "▸" : "▹";
       const mode = interactive ? "interactive session" : "autonomous";
       const agent = args.agent ? theme.fg("dim", ` (${args.agent})`) : "";
+      const cwdHint = args.cwd ? theme.fg("dim", ` in ${args.cwd}`) : "";
       let text =
         `${icon} ` +
         theme.fg("toolTitle", theme.bold(args.name ?? "(unnamed)")) +
         theme.fg("dim", ` — ${mode}`) +
-        agent;
+        agent +
+        cwdHint;
 
       // Show a one-line task preview. renderCall is called repeatedly as the
       // LLM generates tool arguments, so args.task grows token by token.
@@ -652,6 +664,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     model: Type.Optional(Type.String({ description: "Model override" })),
     skills: Type.Optional(Type.String({ description: "Comma-separated skills" })),
     tools: Type.Optional(Type.String({ description: "Comma-separated tools" })),
+    cwd: Type.Optional(Type.String({ description: "Working directory for the sub-agent" })),
   });
 
   shouldRegister("parallel_subagents") && pi.registerTool({
