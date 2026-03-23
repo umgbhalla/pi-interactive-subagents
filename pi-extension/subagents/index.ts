@@ -332,6 +332,7 @@ async function runSubagent(
       envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
     }
     envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
+    envParts.push(`PI_SUBAGENT_INTERACTIVE=${shellEscape(interactive ? "1" : "0")}`);
     if (params.agent) {
       envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
     }
