@@ -264,8 +264,9 @@ async function runSubagent(
       readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"))
     );
 
-    // Use pre-created surface (parallel mode) or create a new one
-    surface = options?.surface ?? createSurface(params.name);
+    // Use pre-created surface (parallel mode) or create a new one.
+    // Autonomous subagents should not steal focus from the orchestrator workspace.
+    surface = options?.surface ?? createSurface(params.name, { focus: interactive });
     if (!surfacePreCreated) {
       await new Promise<void>((resolve) => setTimeout(resolve, 500));
     }
@@ -759,10 +760,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const name = params.agents[i].name;
         if (i === 0) {
           // First agent: split right from the orchestrator
-          surfaces.push(createSurfaceSplit(name, "right"));
+          surfaces.push(createSurfaceSplit(name, "right", undefined, { focus: false }));
         } else {
           // Subsequent agents: split down from the previous agent's surface
-          surfaces.push(createSurfaceSplit(name, "down", surfaces[i - 1]));
+          surfaces.push(createSurfaceSplit(name, "down", surfaces[i - 1], { focus: false }));
         }
       }
 
@@ -1014,8 +1015,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return muxUnavailableResult("tab-title");
       }
       try {
+        const isSubagentSession = !!(process.env.PI_SUBAGENT_NAME || process.env.PI_SUBAGENT_AGENT);
         renameCurrentTab(params.title);
-        renameWorkspace(params.title);
+        if (!isSubagentSession) {
+          renameWorkspace(params.title);
+        }
         return {
           content: [{ type: "text", text: `Title set to: ${params.title}` }],
           details: { title: params.title },

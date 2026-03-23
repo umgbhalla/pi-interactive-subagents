@@ -164,8 +164,8 @@ async function zellijActionAsync(args: string[], surface?: string): Promise<stri
  * Create a new terminal pane as a right split and set its title.
  * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij).
  */
-export function createSurface(name: string): string {
-  return createSurfaceSplit(name, "right");
+export function createSurface(name: string, options?: { focus?: boolean }): string {
+  return createSurfaceSplit(name, "right", undefined, options);
 }
 
 /**
@@ -176,7 +176,9 @@ export function createSurfaceSplit(
   name: string,
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
+  options?: { focus?: boolean },
 ): string {
+  const shouldFocus = options?.focus !== false;
   const backend = requireMuxBackend();
 
   if (backend === "cmux") {
@@ -192,14 +194,19 @@ export function createSurfaceSplit(
     execSync(`cmux rename-tab --surface ${shellEscape(surface)} ${shellEscape(name)}`, {
       encoding: "utf8",
     });
-    execSync(`cmux focus-panel --panel ${shellEscape(surface)}`, {
-      encoding: "utf8",
-    });
+    if (shouldFocus) {
+      execSync(`cmux focus-panel --panel ${shellEscape(surface)}`, {
+        encoding: "utf8",
+      });
+    }
     return surface;
   }
 
   if (backend === "tmux") {
     const args = ["split-window"];
+    if (!shouldFocus) {
+      args.push("-d");
+    }
     if (direction === "left" || direction === "right") {
       args.push("-h");
     } else {
@@ -223,7 +230,9 @@ export function createSurfaceSplit(
     } catch {
       // Optional.
     }
-    execFileSync("tmux", ["select-pane", "-t", pane], { encoding: "utf8" });
+    if (shouldFocus) {
+      execFileSync("tmux", ["select-pane", "-t", pane], { encoding: "utf8" });
+    }
     return pane;
   }
 
