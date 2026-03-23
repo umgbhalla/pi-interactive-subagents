@@ -7,7 +7,9 @@
   "pi": {
     "extensions": [
       "./pi-extension/subagents/index.ts",
-      "./pi-extension/session-artifacts/index.ts"
+      "./pi-extension/session-artifacts/index.ts",
+      "./pi-extension/cmux-status/index.ts",
+      "./pi-extension/idle-nudge/index.ts"
     ]
   },
   "scripts": {
