@@ -159,7 +159,7 @@ export default function (pi: ExtensionAPI) {
         if (remaining > 0) {
           text +=
             theme.fg("muted", `\n... (${remaining} more lines, ${totalLines} total,`) +
-            ` ${keyHint("expandTools", "to expand")})`;
+            ` ${keyHint("app.tools.expand", "to expand")})`;
         }
       }
 

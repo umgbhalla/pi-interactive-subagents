@@ -1,15 +1,14 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { Text } from "@mariozechner/pi-tui";
+import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { basename, dirname, join } from "node:path";
-import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import {
   isMuxAvailable,
   muxSetupHint,
   createSurface,
-  createSurfaceSplit,
   sendCommand,
   pollForExit,
   closeSurface,
@@ -32,9 +31,6 @@ const SubagentParams = Type.Object({
   systemPrompt: Type.Optional(
     Type.String({ description: "Appended to system prompt (role instructions)" })
   ),
-  interactive: Type.Optional(
-    Type.Boolean({ description: "true = user collaborates, false = autonomous. Default: true" })
-  ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
   skills: Type.Optional(Type.String({ description: "Comma-separated skills (overrides agent default)" })),
   tools: Type.Optional(Type.String({ description: "Comma-separated tools (overrides agent default)" })),
@@ -54,7 +50,7 @@ interface AgentDefaults {
 }
 
 /** Tools that are gated by `spawning: false` */
-const SPAWNING_TOOLS = new Set(["subagent", "parallel_subagents", "subagents_list", "subagent_resume"]);
+const SPAWNING_TOOLS = new Set(["subagent", "subagents_list", "subagent_resume"]);
 
 /**
  * Resolve the effective set of denied tool names from agent defaults.
@@ -182,40 +178,6 @@ function formatBytes(bytes: number): string {
  * Returns { file, entries, bytes } — `file` is the path that was measured,
  * so callers can lock onto it for subsequent calls.
  */
-function measureSessionProgress(
-  sessionDir: string,
-  existingFiles: Set<string>,
-  trackedFile?: string | null,
-  excludeFiles?: Set<string>,
-): { file: string; entries: number; bytes: number } | null {
-  try {
-    // If we already know which file to track, use it directly
-    if (trackedFile) {
-      const stat = statSync(trackedFile);
-      const raw = readFileSync(trackedFile, "utf8");
-      const entries = raw.split("\n").filter((l) => l.trim()).length;
-      return { file: trackedFile, entries, bytes: stat.size };
-    }
-
-    // Find the newest session file that wasn't there before
-    // and hasn't been claimed by another parallel agent
-    const newFiles = readdirSync(sessionDir)
-      .filter((f) => f.endsWith(".jsonl") && !existingFiles.has(f) && !(excludeFiles?.has(f)))
-      .map((f) => {
-        const p = join(sessionDir, f);
-        return { name: f, path: p, mtime: statSync(p).mtimeMs };
-      })
-      .sort((a, b) => b.mtime - a.mtime);
-    if (newFiles.length === 0) return null;
-    const stat = statSync(newFiles[0].path);
-    const raw = readFileSync(newFiles[0].path, "utf8");
-    const entries = raw.split("\n").filter((l) => l.trim()).length;
-    return { file: newFiles[0].path, entries, bytes: stat.size };
-  } catch {
-    return null;
-  }
-}
-
 /**
  * Result from running a single subagent.
  */
@@ -224,27 +186,156 @@ interface SubagentResult {
   task: string;
   summary: string;
   sessionFile?: string;
-  interactive: boolean;
   exitCode: number;
   elapsed: number;
   error?: string;
 }
 
 /**
- * Core subagent execution logic. Spawns a sub-agent in a multiplexer pane,
- * polls for completion, extracts the summary, and returns a structured result.
- *
- * Used by both `subagent` (single) and `parallel_subagents` (concurrent) tools.
+ * State for a launched (but not yet completed) subagent.
  */
-async function runSubagent(
+interface RunningSubagent {
+  id: string;
+  name: string;
+  task: string;
+  agent?: string;
+  surface: string;
+  startTime: number;
+  sessionFile: string;
+  entries?: number;
+  bytes?: number;
+  forkCleanupFile?: string;
+  abortController?: AbortController;
+}
+
+/** All currently running subagents, keyed by id. */
+const runningSubagents = new Map<string, RunningSubagent>();
+
+
+
+// ── Widget management ──
+
+/** Latest ExtensionContext from session_start, used for widget updates. */
+let latestCtx: ExtensionContext | null = null;
+
+/** Interval timer for widget re-renders. */
+let widgetInterval: ReturnType<typeof setInterval> | null = null;
+
+function formatElapsedMMSS(startTime: number): string {
+  const seconds = Math.floor((Date.now() - startTime) / 1000);
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+const ACCENT = "\x1b[38;2;77;163;255m";
+const RST = "\x1b[0m";
+
+/**
+ * Build a bordered content line: │left          right│
+ * Left content is truncated if needed, right is preserved, padded to fill width.
+ */
+function borderLine(left: string, right: string, width: number): string {
+  // width = total visible chars for the whole line including │ and │
+  const contentWidth = Math.max(0, width - 2); // space inside the two │ chars
+  const rightVis = visibleWidth(right);
+  const maxLeft = Math.max(0, contentWidth - rightVis);
+  const truncLeft = truncateToWidth(left, maxLeft);
+  const leftVis = visibleWidth(truncLeft);
+  const pad = Math.max(0, contentWidth - leftVis - rightVis);
+  return `${ACCENT}│${RST}${truncLeft}${" ".repeat(pad)}${right}${ACCENT}│${RST}`;
+}
+
+/**
+ * Build the bordered top line: ╭─ Title ──── info ─╮
+ * All chars are accounted for within `width`.
+ */
+function borderTop(title: string, info: string, width: number): string {
+  // ╭─ Title ───...─── info ─╮
+  // overhead: ╭─ (2) + space around title (2) + space around info (2) + ─╮ (2) = but we simplify
+  const inner = Math.max(0, width - 2); // inside ╭ and ╮
+  const titlePart = `─ ${title} `;
+  const infoPart = ` ${info} ─`;
+  const fillLen = Math.max(0, inner - titlePart.length - infoPart.length);
+  const fill = "─".repeat(fillLen);
+  const content = `${titlePart}${fill}${infoPart}`.slice(0, inner).padEnd(inner, "─");
+  return `${ACCENT}╭${content}╮${RST}`;
+}
+
+/**
+ * Build the bordered bottom line: ╰──────────────────╯
+ */
+function borderBottom(width: number): string {
+  const inner = Math.max(0, width - 2);
+  return `${ACCENT}╰${"─".repeat(inner)}╯${RST}`;
+}
+
+function updateWidget() {
+  if (!latestCtx?.hasUI) return;
+
+  if (runningSubagents.size === 0) {
+    latestCtx.ui.setWidget("subagent-status", undefined);
+    if (widgetInterval) {
+      clearInterval(widgetInterval);
+      widgetInterval = null;
+    }
+    return;
+  }
+
+  latestCtx.ui.setWidget(
+    "subagent-status",
+    (_tui: any, _theme: any) => {
+      return {
+        invalidate() {},
+        render(width: number) {
+          const count = runningSubagents.size;
+          const title = "Subagents";
+          const info = `${count} running`;
+
+          const lines: string[] = [borderTop(title, info, width)];
+
+          for (const [_id, agent] of runningSubagents) {
+            const elapsed = formatElapsedMMSS(agent.startTime);
+            const agentTag = agent.agent ? ` (${agent.agent})` : "";
+            const left = ` ${elapsed}  ${agent.name}${agentTag} `;
+            const right =
+              agent.entries != null && agent.bytes != null
+                ? ` ${agent.entries} msgs (${formatBytes(agent.bytes)}) `
+                : " starting… ";
+
+            lines.push(borderLine(left, right, width));
+          }
+
+          lines.push(borderBottom(width));
+          return lines;
+        },
+      };
+    },
+    { placement: "aboveEditor" },
+  );
+}
+
+function startWidgetRefresh() {
+  if (widgetInterval) return;
+  updateWidget(); // immediate first render
+  widgetInterval = setInterval(() => {
+    updateWidget();
+  }, 1000);
+}
+
+/**
+ * Launch a subagent: creates the multiplexer pane, builds the command, and
+ * sends it. Returns a RunningSubagent — does NOT poll.
+ *
+ * Call watchSubagent() on the returned object to observe completion.
+ */
+async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string }; cwd: string },
-  signal: AbortSignal,
-  onProgress?: (info: { elapsed: string; entries?: number; bytes?: number }) => void,
-  options?: { surface?: string; claimedFiles?: Set<string> },
-): Promise<SubagentResult> {
-  const interactive = params.interactive !== false;
+  options?: { surface?: string },
+): Promise<RunningSubagent> {
   const startTime = Date.now();
+  const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const effectiveModel = params.model ?? agentDefs?.model;
@@ -255,93 +346,116 @@ async function runSubagent(
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
 
-  let surface: string | null = null;
+  const sessionDir = dirname(sessionFile);
+
+  // Generate a deterministic session file path for this subagent.
+  // This eliminates race conditions when multiple agents launch simultaneously —
+  // each agent knows exactly which file is theirs.
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 23) + "Z";
+  const uuid = [id, Math.random().toString(16).slice(2, 10), Math.random().toString(16).slice(2, 10), Math.random().toString(16).slice(2, 6)].join("-");
+  const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
+
+  // Use pre-created surface (parallel mode) or create a new one.
+  // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
+  const surface = options?.surface ?? createSurface(params.name);
+  if (!surfacePreCreated) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 500));
+  }
 
-  try {
-    const sessionDir = dirname(sessionFile);
-    const existingSessionFiles = new Set(
-      readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"))
-    );
+  // Build the task message
+  // When forking, the sub-agent already has the full conversation context.
+  // Only send the user's task as a clean message — no wrapper instructions
+  // that would confuse the agent into thinking it needs to restart.
+  const modeHint = "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
+  const summaryInstruction =
+    "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
+  const denySet = resolveDenyTools(agentDefs);
+  const agentType = params.agent ?? params.name;
+  const tabTitleInstruction = denySet.has("set_tab_title") ? "" :
+    `As your FIRST action, set the tab title using set_tab_title. ` +
+    `The title MUST start with [${agentType}] followed by a short description of your current task. ` +
+    `Example: "[${agentType}] Analyzing auth module". Keep it concise.`;
+  const identity = agentDefs?.body ?? params.systemPrompt ?? null;
+  const roleBlock = identity ? `\n\n${identity}` : "";
+  const fullTask = params.fork
+    ? params.task
+    : `${roleBlock}\n\n${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}\n\n${summaryInstruction}`;
 
-    // Use pre-created surface (parallel mode) or create a new one.
-    // Autonomous subagents should not steal focus from the orchestrator workspace.
-    surface = options?.surface ?? createSurface(params.name, { focus: interactive });
-    if (!surfacePreCreated) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 500));
+  // Build pi command
+  const parts: string[] = ["pi"];
+  parts.push("--session", shellEscape(subagentSessionFile));
+
+  // For fork mode, create a clean copy of the session that excludes
+  // the "Use subagent..." meta-message and tool call that triggered this.
+  // The forked session sees only the original conversation + the user's actual task.
+  let forkCleanupFile: string | undefined;
+  if (params.fork) {
+    const raw = readFileSync(sessionFile, "utf8");
+    const lines = raw.split("\n").filter((l) => l.trim());
+
+    // Walk backwards to find the last user message (the meta-instruction)
+    // and truncate everything from there onwards
+    let truncateAt = lines.length;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const entry = JSON.parse(lines[i]);
+        if (entry.type === "message" && entry.message?.role === "user") {
+          truncateAt = i;
+          break;
+        }
+      } catch {}
     }
 
-    // Build the task message
-    // When forking, the sub-agent already has the full conversation context.
-    // Only send the user's task as a clean message — no wrapper instructions
-    // that would confuse the agent into thinking it needs to restart.
-    const modeHint = interactive
-      ? "The user will interact with you here. When done, they will exit with Ctrl+D."
-      : "Complete your task autonomously. When finished, call the subagent_done tool to close this session.";
-    const summaryInstruction =
-      "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
-    const denySet = resolveDenyTools(agentDefs);
-    const agentType = params.agent ?? params.name;
-    const tabTitleInstruction = denySet.has("set_tab_title") ? "" :
-      `As your FIRST action, set the tab title using set_tab_title. ` +
-      `The title MUST start with [${agentType}] followed by a short description of your current task. ` +
-      `Example: "[${agentType}] Analyzing auth module". Keep it concise.`;
-    const identity = agentDefs?.body ?? params.systemPrompt ?? null;
-    const roleBlock = identity ? `\n\n${identity}` : "";
-    const forkPreamble =
-      "[Session forked for focused work. Continue naturally from the conversation above. " +
-      "Do NOT restart or re-execute anything already done.]\n\n";
-    const fullTask = params.fork
-      ? `${forkPreamble}${params.task}`
-      : `${roleBlock}\n\n${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}\n\n${summaryInstruction}`;
+    const cleanLines = lines.slice(0, truncateAt);
+    forkCleanupFile = join(tmpdir(), `pi-fork-clean-${Date.now()}.jsonl`);
+    writeFileSync(forkCleanupFile, cleanLines.join("\n") + "\n", "utf8");
+    parts.push("--fork", shellEscape(forkCleanupFile));
+  }
 
-    // Build pi command
-    const parts: string[] = ["pi"];
-    parts.push("--session-dir", shellEscape(dirname(sessionFile)));
+  const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
+  parts.push("-e", shellEscape(subagentDonePath));
 
-    if (params.fork) {
-      parts.push("--fork", shellEscape(sessionFile));
+  if (effectiveModel) {
+    const model = effectiveThinking
+      ? `${effectiveModel}:${effectiveThinking}`
+      : effectiveModel;
+    parts.push("--model", shellEscape(model));
+  }
+
+  if (effectiveTools) {
+    const BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+    const builtins = effectiveTools.split(",").map((t) => t.trim()).filter((t) => BUILTIN_TOOLS.has(t));
+    if (builtins.length > 0) {
+      parts.push("--tools", shellEscape(builtins.join(",")));
     }
+  }
 
-    const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
-    parts.push("-e", shellEscape(subagentDonePath));
-
-    if (effectiveModel) {
-      const model = effectiveThinking
-        ? `${effectiveModel}:${effectiveThinking}`
-        : effectiveModel;
-      parts.push("--model", shellEscape(model));
+  if (effectiveSkills) {
+    for (const skill of effectiveSkills.split(",").map((s) => s.trim()).filter(Boolean)) {
+      parts.push(shellEscape(`/skill:${skill}`));
     }
+  }
 
-    if (effectiveTools) {
-      const BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
-      const builtins = effectiveTools.split(",").map((t) => t.trim()).filter((t) => BUILTIN_TOOLS.has(t));
-      if (builtins.length > 0) {
-        parts.push("--tools", shellEscape(builtins.join(",")));
-      }
-    }
+  // Build env prefix: denied tools + subagent identity
+  const envParts: string[] = [];
+  if (denySet.size > 0) {
+    envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
+  }
+  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
+  if (params.agent) {
+    envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
+  }
+  const envPrefix = envParts.join(" ") + " ";
 
-    if (effectiveSkills) {
-      for (const skill of effectiveSkills.split(",").map((s) => s.trim()).filter(Boolean)) {
-        parts.push(shellEscape(`/skill:${skill}`));
-      }
-    }
-
-    // Build env prefix: denied tools + subagent identity
-    const envParts: string[] = [];
-    if (denySet.size > 0) {
-      envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
-    }
-    envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
-    envParts.push(`PI_SUBAGENT_INTERACTIVE=${shellEscape(interactive ? "1" : "0")}`);
-    if (params.agent) {
-      envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
-    }
-    const envPrefix = envParts.join(" ") + " ";
-
-    // Write task to an artifact file and pass via @file.
-    // pi combines @file text and CLI messages into a single initial user message,
-    // so the agent receives this as a normal user prompt (not a file attachment).
+  // Pass task to the sub-agent.
+  // For fork mode, pass as a plain quoted argument — the forked session already
+  // has the full conversation context, so the message arrives as if the user typed it.
+  // For non-fork mode, write to an artifact file and pass via @file to handle
+  // long task descriptions with role/instructions safely.
+  if (params.fork) {
+    parts.push(shellEscape(fullTask));
+  } else {
     const sessionId = ctx.sessionManager.getSessionId();
     const artifactDir = getArtifactDir(ctx.cwd, sessionId);
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
@@ -350,64 +464,67 @@ async function runSubagent(
     mkdirSync(dirname(artifactPath), { recursive: true });
     writeFileSync(artifactPath, fullTask, "utf8");
     parts.push(`@${artifactPath}`);
+  }
 
-    // Resolve cwd — param overrides agent default, supports absolute and relative paths
-    const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
-    const effectiveCwd = rawCwd
-      ? (rawCwd.startsWith("/") ? rawCwd : join(process.cwd(), rawCwd))
-      : null;
-    const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
+  // Resolve cwd — param overrides agent default, supports absolute and relative paths
+  const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
+  const effectiveCwd = rawCwd
+    ? (rawCwd.startsWith("/") ? rawCwd : join(process.cwd(), rawCwd))
+    : null;
+  const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
-    const piCommand = cdPrefix + envPrefix + parts.join(" ");
-    const command = `${piCommand}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
-    sendCommand(surface, command);
+  const piCommand = cdPrefix + envPrefix + parts.join(" ");
+  const command = `${piCommand}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
+  sendCommand(surface, command);
 
-    // Track which session file belongs to THIS agent.
-    // In parallel mode, multiple agents share the same session directory.
-    // Without tracking, they'd all pick the "newest" file (same one).
-    let trackedFile: string | null = null;
-    const claimedFiles = options?.claimedFiles;
+  const running: RunningSubagent = {
+    id,
+    name: params.name,
+    task: params.task,
+    agent: params.agent,
+    surface,
+    startTime,
+    sessionFile: subagentSessionFile,
+    forkCleanupFile,
+  };
 
-    // Poll for exit
-    const interval = interactive ? 3000 : 1000;
+  runningSubagents.set(id, running);
+  return running;
+}
+
+/**
+ * Watch a launched subagent until it exits. Polls for completion, extracts
+ * the summary from the session file, cleans up the surface and fork file,
+ * and removes the entry from runningSubagents.
+ */
+async function watchSubagent(
+  running: RunningSubagent,
+  signal: AbortSignal,
+): Promise<SubagentResult> {
+  const { name, task, surface, startTime, sessionFile, forkCleanupFile } = running;
+
+  try {
     const exitCode = await pollForExit(surface, signal, {
-      interval,
+      interval: 1000,
       onTick() {
-        const elapsed = formatElapsed(Math.floor((Date.now() - startTime) / 1000));
-        const progress = measureSessionProgress(
-          sessionDir, existingSessionFiles,
-          trackedFile, claimedFiles,
-        );
-        if (progress && !trackedFile) {
-          // Lock onto this file and claim it so other parallel agents skip it
-          trackedFile = progress.file;
-          if (claimedFiles) {
-            claimedFiles.add(basename(progress.file));
+        // Update entries/bytes for widget display
+        try {
+          if (existsSync(sessionFile)) {
+            const stat = statSync(sessionFile);
+            const raw = readFileSync(sessionFile, "utf8");
+            running.entries = raw.split("\n").filter((l) => l.trim()).length;
+            running.bytes = stat.size;
           }
-        }
-        onProgress?.({ elapsed, entries: progress?.entries, bytes: progress?.bytes });
+        } catch {}
       },
     });
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
-    // Find session file — use tracked file if we already identified it
-    let subSessionFile: { path: string } | undefined;
-    if (trackedFile) {
-      subSessionFile = { path: trackedFile };
-    } else {
-      // Fallback: scan for new files (single-agent mode or file appeared late)
-      const newFiles = readdirSync(sessionDir)
-        .filter((f) => f.endsWith(".jsonl") && !existingSessionFiles.has(f))
-        .map((f) => ({ name: f, path: join(sessionDir, f), mtime: statSync(join(sessionDir, f)).mtimeMs }))
-        .sort((a, b) => b.mtime - a.mtime);
-      subSessionFile = newFiles[0];
-    }
-
-    // Extract summary
+    // Extract summary from the known session file
     let summary: string;
-    if (subSessionFile) {
-      const allEntries = getNewEntries(subSessionFile.path, 0);
+    if (existsSync(sessionFile)) {
+      const allEntries = getNewEntries(sessionFile, 0);
       summary =
         findLastAssistantMessage(allEntries) ??
         (exitCode !== 0
@@ -420,38 +537,35 @@ async function runSubagent(
     }
 
     closeSurface(surface);
-    surface = null;
+    runningSubagents.delete(running.id);
 
-    return {
-      name: params.name,
-      task: params.task,
-      summary,
-      sessionFile: subSessionFile?.path,
-      interactive,
-      exitCode,
-      elapsed,
-    };
-  } catch (err: any) {
-    if (surface) {
-      try { closeSurface(surface); } catch {}
-      surface = null;
+    // Clean up temp fork file
+    if (forkCleanupFile) {
+      try { unlinkSync(forkCleanupFile); } catch {}
     }
+
+    return { name, task, summary, sessionFile, exitCode, elapsed };
+  } catch (err: any) {
+    if (forkCleanupFile) {
+      try { unlinkSync(forkCleanupFile); } catch {}
+    }
+    try { closeSurface(surface); } catch {}
+    runningSubagents.delete(running.id);
+
     if (signal.aborted) {
       return {
-        name: params.name,
-        task: params.task,
+        name,
+        task,
         summary: "Subagent cancelled.",
-        interactive,
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: "cancelled",
       };
     }
     return {
-      name: params.name,
-      task: params.task,
+      name,
+      task,
       summary: `Subagent error: ${err?.message ?? String(err)}`,
-      interactive,
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
@@ -459,7 +573,25 @@ async function runSubagent(
   }
 }
 
+
 export default function subagentsExtension(pi: ExtensionAPI) {
+  // Capture the UI context for widget updates
+  pi.on("session_start", (_event, ctx) => {
+    latestCtx = ctx;
+  });
+
+  // Clean up on session shutdown
+  pi.on("session_shutdown", (_event, _ctx) => {
+    if (widgetInterval) {
+      clearInterval(widgetInterval);
+      widgetInterval = null;
+    }
+    for (const [_id, agent] of runningSubagents) {
+      agent.abortController?.abort();
+    }
+    runningSubagents.clear();
+  });
+
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
   const deniedTools = new Set(
     (process.env.PI_DENY_TOOLS ?? "").split(",").map((s) => s.trim()).filter(Boolean)
@@ -472,17 +604,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     name: "subagent",
     label: "Subagent",
     description:
-      "Spawn a sub-agent in a dedicated terminal multiplexer pane with shared session context. " +
-      "The sub-agent branches from the current session, works independently (interactive or autonomous), " +
-      "and returns results via a branch summary. Supports cmux, tmux, and zellij.",
+      "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+      "Returns immediately — the agent runs in the background and steers results back when done. " +
+      "Supports cmux, tmux, and zellij.",
     promptSnippet:
-      "Spawn a sub-agent in a dedicated terminal multiplexer pane with shared session context. " +
-      "The sub-agent branches from the current session, works independently (interactive or autonomous), " +
-      "and returns results via a branch summary. Supports cmux, tmux, and zellij.",
+      "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+      "Returns immediately — the agent runs in the background and steers results back when done. " +
+      "Supports cmux, tmux, and zellij.",
     parameters: SubagentParams,
 
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const interactive = params.interactive !== false;
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      // Prevent self-spawning (e.g. planner spawning another planner)
+      const currentAgent = process.env.PI_SUBAGENT_AGENT;
+      if (params.agent && currentAgent && params.agent === currentAgent) {
+        return {
+          content: [{ type: "text", text: `You are the ${currentAgent} agent — do not start another ${currentAgent}. You were spawned to do this work yourself. Complete the task directly.` }],
+          details: { error: "self-spawn blocked" },
+        };
+      }
 
       // Validate prerequisites
       if (!isMuxAvailable()) {
@@ -496,70 +635,69 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       }
 
-      const startTime = Date.now();
+      // Launch the subagent (creates pane, sends command)
+      const running = await launchSubagent(params, ctx);
 
-      onUpdate?.({
-        content: [{ type: "text", text: "starting…" }],
-        details: {
-          name: params.name,
-          interactive,
-          task: params.task,
-          startTime,
-        },
-      });
+      // Create a separate AbortController for the watcher
+      // (the tool's signal completes when we return)
+      const watcherAbort = new AbortController();
+      running.abortController = watcherAbort;
 
-      const result = await runSubagent(params, ctx, signal ?? new AbortController().signal, (info) => {
-        onUpdate?.({
-          content: [{ type: "text", text: `${info.elapsed} elapsed` }],
+      // Start widget refresh when first agent launches
+      startWidgetRefresh();
+
+      // Fire-and-forget: start watching in background
+      watchSubagent(running, watcherAbort.signal).then((result) => {
+        updateWidget(); // reflect removal from Map immediately
+        const sessionRef = result.sessionFile
+          ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
+          : "";
+        const content = result.exitCode !== 0
+          ? `Sub-agent "${running.name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
+          : `Sub-agent "${running.name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+
+        pi.sendMessage({
+          customType: "subagent_result",
+          content,
+          display: true,
           details: {
-            name: params.name,
-            interactive,
-            task: params.task,
-            startTime,
-            sessionEntries: info.entries,
-            sessionBytes: info.bytes,
+            name: running.name,
+            task: running.task,
+            agent: running.agent,
+            exitCode: result.exitCode,
+            elapsed: result.elapsed,
+            sessionFile: result.sessionFile,
           },
-        });
+        }, { triggerTurn: true, deliverAs: "steer" });
+      }).catch((err) => {
+        updateWidget();
+        pi.sendMessage({
+          customType: "subagent_result",
+          content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+          display: true,
+          details: { name: running.name, task: running.task, error: err?.message },
+        }, { triggerTurn: true, deliverAs: "steer" });
       });
 
-      if (result.error) {
-        return {
-          content: [{ type: "text", text: result.summary }],
-          details: { error: result.error },
-        };
-      }
-
-      const sessionRef = result.sessionFile
-        ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
-        : "";
-      const resultText =
-        result.exitCode !== 0
-          ? `Sub-agent exited with code ${result.exitCode}.\n\n${result.summary}${sessionRef}`
-          : `${result.summary}${sessionRef}`;
-
+      // Return immediately
       return {
-        content: [{ type: "text", text: resultText }],
+        content: [{ type: "text", text: `Sub-agent "${params.name}" started.` }],
         details: {
+          id: running.id,
           name: params.name,
           task: params.task,
-          sessionFile: result.sessionFile,
-          interactive,
-          exitCode: result.exitCode,
-          elapsed: result.elapsed,
+          agent: params.agent,
+          status: "started",
         },
       };
     },
 
     renderCall(args, theme) {
-      const interactive = args.interactive !== false;
-      const icon = interactive ? "▸" : "▹";
-      const mode = interactive ? "interactive session" : "autonomous";
       const agent = args.agent ? theme.fg("dim", ` (${args.agent})`) : "";
       const cwdHint = args.cwd ? theme.fg("dim", ` in ${args.cwd}`) : "";
       let text =
-        `${icon} ` +
+        "▸ " +
         theme.fg("toolTitle", theme.bold(args.name ?? "(unnamed)")) +
-        theme.fg("dim", ` — ${mode}`) +
         agent +
         cwdHint;
 
@@ -582,338 +720,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       return new Text(text, 0, 0);
     },
 
-    renderResult(result, { expanded, isPartial }, theme) {
+    renderResult(result, _opts, theme) {
       const details = result.details as any;
       const name = details?.name ?? "(unnamed)";
-      const interactive = details?.interactive !== false;
 
-      if (isPartial) {
-        const startTime: number | undefined = details?.startTime;
-        const sessionEntries: number | undefined = details?.sessionEntries;
-        const sessionBytes: number | undefined = details?.sessionBytes;
-
-        const elapsedText = startTime
-          ? formatElapsed(Math.floor((Date.now() - startTime) / 1000))
-          : "…";
-
-        let progressParts: string[] = [elapsedText];
-        if (sessionEntries != null && sessionBytes != null) {
-          progressParts.push(`${sessionEntries} msgs (${formatBytes(sessionBytes)})`);
-        } else {
-          progressParts.push("loading…");
-        }
-
-        let text = theme.fg("dim", progressParts.join(" · "));
-
-        if (interactive) {
-          text +=
-            "\n" +
-            theme.fg("accent", `Switch to the "${name}" terminal. `) +
-            theme.fg("dim", "Exit (Ctrl+D) to return.");
-        }
-
-        return new Text(text, 0, 0);
-      }
-
-      // Completed
-      const exitCode = details?.exitCode ?? 0;
-      const elapsed = details?.elapsed != null ? formatElapsed(details.elapsed) : "?";
-      const summaryText =
-        typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
-
-      if (exitCode !== 0) {
-        const text =
-          theme.fg("error", "✗") +
-          " " +
+      // "Started" result — tool returned immediately
+      if (details?.status === "started") {
+        return new Text(
+          theme.fg("accent", "▸") + " " +
           theme.fg("toolTitle", theme.bold(name)) +
-          theme.fg("dim", ` — failed (exit code ${exitCode})`);
-        return new Text(text, 0, 0);
+          theme.fg("dim", " — started"),
+          0, 0
+        );
       }
 
-      // Strip session path from summary for the preview (it's shown separately)
-      const sessionPath: string | undefined = details?.sessionFile;
-      const cleanSummary = summaryText.replace(/\n\nSession: .+\nResume: .+$/, "").replace(/\n\nSession: .+$/, "");
-
-      let text =
-        theme.fg("success", "✓") +
-        " " +
-        theme.fg("toolTitle", theme.bold(name)) +
-        theme.fg("dim", ` — completed (${elapsed})`);
-
-      if (expanded) {
-        // Full view: task + summary + session info
-        const task: string | undefined = details?.task;
-        if (task) {
-          text += "\n" + theme.fg("dim", "─── task ───");
-          text += "\n" + theme.fg("toolOutput", task);
-          text += "\n" + theme.fg("dim", "─── result ───");
-        }
-        if (cleanSummary) {
-          text += "\n" + theme.fg("text", cleanSummary);
-        }
-        if (sessionPath) {
-          text += "\n" + theme.fg("dim", `Session: ${sessionPath}`);
-          text += "\n" + theme.fg("dim", `Resume:  pi --session ${sessionPath}`);
-        }
-      } else {
-        // Collapsed: one-line preview + expand hint
-        const preview = cleanSummary.length > 120
-          ? cleanSummary.slice(0, 120) + "…"
-          : cleanSummary;
-        if (preview) {
-          text += "\n" + theme.fg("text", preview);
-        }
-        text += " " + theme.fg("muted", `(${keyHint("expandTools", "to expand")})`);
-      }
-
-      return new Text(text, 0, 0);
+      // Fallback (shouldn't happen)
+      const text = typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
+      return new Text(theme.fg("dim", text), 0, 0);
     },
   });
 
-  // ── parallel_subagents tool ──
-  const ParallelSubagentEntry = Type.Object({
-    name: Type.String({ description: "Display name for this subagent" }),
-    task: Type.String({ description: "Task/prompt for the sub-agent" }),
-    agent: Type.Optional(Type.String({ description: "Agent name to load defaults from (e.g. 'scout', 'worker')" })),
-    systemPrompt: Type.Optional(Type.String({ description: "Appended to system prompt" })),
-    model: Type.Optional(Type.String({ description: "Model override" })),
-    skills: Type.Optional(Type.String({ description: "Comma-separated skills" })),
-    tools: Type.Optional(Type.String({ description: "Comma-separated tools" })),
-    cwd: Type.Optional(Type.String({ description: "Working directory for the sub-agent" })),
-  });
-
-  shouldRegister("parallel_subagents") && pi.registerTool({
-    name: "parallel_subagents",
-    label: "Parallel Subagents",
-    description:
-      "Run multiple autonomous sub-agents concurrently. Each agent spawns in its own multiplexer pane " +
-      "and runs independently. Results stream in as each agent completes so you do not have to wait for all of them. " +
-      "Use for independent tasks like scouting different parts of a codebase, parallel research, or non-overlapping work.",
-    promptSnippet:
-      "Run multiple autonomous sub-agents concurrently. Each agent spawns in its own multiplexer pane " +
-      "and runs independently. Results stream in as each agent completes so you do not have to wait for all of them. " +
-      "Use for independent tasks like scouting different parts of a codebase, parallel research, or non-overlapping work.",
-    parameters: Type.Object({
-      agents: Type.Array(ParallelSubagentEntry, {
-        description: "Array of subagent configurations to run in parallel",
-        minItems: 1,
-      }),
-    }),
-
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      if (!isMuxAvailable()) {
-        return muxUnavailableResult("subagents");
-      }
-
-      if (!ctx.sessionManager.getSessionFile()) {
-        return {
-          content: [{ type: "text", text: "Error: no session file. Start pi with a persistent session to use subagents." }],
-          details: { error: "no session file" },
-        };
-      }
-
-      const startTime = Date.now();
-      const total = params.agents.length;
-      const completed: SubagentResult[] = [];
-      const agentStatus = new Map<string, { elapsed: string; entries?: number; bytes?: number; done: boolean }>();
-
-      // Initialize status for all agents
-      for (const a of params.agents) {
-        agentStatus.set(a.name, { elapsed: "0s", done: false });
-      }
-
-      const emitProgress = () => {
-        const lines: string[] = [];
-        for (const a of params.agents) {
-          const status = agentStatus.get(a.name)!;
-          if (status.done) {
-            const result = completed.find((r) => r.name === a.name);
-            const icon = result && result.exitCode === 0 ? "✓" : "✗";
-            lines.push(`${icon} ${a.name} — done (${formatElapsed(result?.elapsed ?? 0)})`);
-          } else {
-            const parts = [status.elapsed];
-            if (status.entries != null && status.bytes != null) {
-              parts.push(`${status.entries} msgs (${formatBytes(status.bytes)})`);
-            }
-            lines.push(`⟳ ${a.name} — ${parts.join(" · ")}`);
-          }
-        }
-
-        onUpdate?.({
-          content: [{ type: "text", text: lines.join("\n") }],
-          details: {
-            startTime,
-            total,
-            completed: completed.length,
-            agents: Object.fromEntries(agentStatus),
-          },
-        });
-      };
-
-      emitProgress();
-
-      // Pre-create all surfaces with a tiled layout:
-      // First agent splits right from the orchestrator (side-by-side),
-      // subsequent agents split down from the first (stacked vertically).
-      const surfaces: string[] = [];
-      for (let i = 0; i < params.agents.length; i++) {
-        const name = params.agents[i].name;
-        if (i === 0) {
-          // First agent: split right from the orchestrator
-          surfaces.push(createSurfaceSplit(name, "right", undefined, { focus: false }));
-        } else {
-          // Subsequent agents: split down from the previous agent's surface
-          surfaces.push(createSurfaceSplit(name, "down", surfaces[i - 1], { focus: false }));
-        }
-      }
-
-      // Brief pause for surfaces to initialize
-      await new Promise<void>((resolve) => setTimeout(resolve, 500));
-
-      // Shared set of claimed session files — prevents parallel agents
-      // from all locking onto the same "newest" file during progress polling.
-      const claimedFiles = new Set<string>();
-
-      // Run all agents concurrently
-      const effectiveSignal = signal ?? new AbortController().signal;
-      const promises = params.agents.map(async (agentParams, i) => {
-        // Force interactive: false for parallel agents
-        const fullParams = { ...agentParams, interactive: false as const, fork: false as const };
-
-        const result = await runSubagent(fullParams, ctx, effectiveSignal, (info) => {
-          agentStatus.set(agentParams.name, {
-            elapsed: info.elapsed,
-            entries: info.entries,
-            bytes: info.bytes,
-            done: false,
-          });
-          emitProgress();
-        }, { surface: surfaces[i], claimedFiles });
-
-        // Mark as done and emit progress immediately
-        agentStatus.set(agentParams.name, { elapsed: formatElapsed(result.elapsed), done: true });
-        completed.push(result);
-        emitProgress();
-
-        return result;
-      });
-
-      const results = await Promise.all(promises);
-      const totalElapsed = Math.floor((Date.now() - startTime) / 1000);
-
-      // Build combined result text
-      const sections = results.map((r) => {
-        const icon = r.exitCode === 0 ? "✓" : "✗";
-        const sessionRef = r.sessionFile
-          ? `\nSession: ${r.sessionFile}\nResume: pi --session ${r.sessionFile}`
-          : "";
-        return `## ${icon} ${r.name} (${formatElapsed(r.elapsed)})\n\n${r.summary}${sessionRef}`;
-      });
-
-      const succeeded = results.filter((r) => r.exitCode === 0).length;
-      const failed = results.filter((r) => r.exitCode !== 0).length;
-      const header = `${succeeded}/${total} succeeded` + (failed > 0 ? `, ${failed} failed` : "") + ` in ${formatElapsed(totalElapsed)}`;
-
-      return {
-        content: [{ type: "text", text: `${header}\n\n${sections.join("\n\n")}` }],
-        details: {
-          total,
-          succeeded,
-          failed,
-          elapsed: totalElapsed,
-          results: results.map((r) => ({
-            name: r.name,
-            task: r.task,
-            exitCode: r.exitCode,
-            elapsed: r.elapsed,
-            sessionFile: r.sessionFile,
-          })),
-        },
-      };
-    },
-
-    renderCall(args, theme) {
-      const agents = args.agents ?? [];
-      let text = theme.fg("toolTitle", theme.bold("Parallel Subagents")) +
-        theme.fg("dim", ` — ${agents.length} agent${agents.length !== 1 ? "s" : ""}`);
-
-      for (const a of agents) {
-        const agent = a.agent ? theme.fg("dim", ` (${a.agent})`) : "";
-        const task = a.task ?? "";
-        const firstLine = task.split("\n").find((l: string) => l.trim()) ?? "";
-        const preview = firstLine.length > 80 ? firstLine.slice(0, 80) + "…" : firstLine;
-        text += "\n  ▹ " + theme.fg("toolOutput", a.name ?? "unnamed") + agent;
-        if (preview) text += theme.fg("dim", ` — ${preview}`);
-      }
-
-      return new Text(text, 0, 0);
-    },
-
-    renderResult(result, { expanded, isPartial }, theme) {
-      const details = result.details as any;
-
-      if (isPartial) {
-        const total: number = details?.total ?? 0;
-        const completedCount: number = details?.completed ?? 0;
-        const startTime: number | undefined = details?.startTime;
-        const elapsed = startTime
-          ? formatElapsed(Math.floor((Date.now() - startTime) / 1000))
-          : "…";
-        const agents: Record<string, { elapsed: string; entries?: number; bytes?: number; done: boolean }> =
-          details?.agents ?? {};
-
-        let text = theme.fg("dim", `${completedCount}/${total} done · ${elapsed} elapsed`);
-
-        for (const [name, status] of Object.entries(agents)) {
-          if (status.done) {
-            text += "\n  " + theme.fg("success", "✓") + " " + theme.fg("toolTitle", name) +
-              theme.fg("dim", ` — done`);
-          } else {
-            const parts = [status.elapsed];
-            if (status.entries != null && status.bytes != null) {
-              parts.push(`${status.entries} msgs (${formatBytes(status.bytes)})`);
-            } else {
-              parts.push("loading…");
-            }
-            text += "\n  " + theme.fg("dim", "⟳") + " " + theme.fg("toolTitle", name) +
-              theme.fg("dim", ` — ${parts.join(" · ")}`);
-          }
-        }
-
-        return new Text(text, 0, 0);
-      }
-
-      // Completed
-      const total: number = details?.total ?? 0;
-      const succeeded: number = details?.succeeded ?? 0;
-      const failed: number = details?.failed ?? 0;
-      const elapsed: number = details?.elapsed ?? 0;
-      const results: any[] = details?.results ?? [];
-
-      const statusIcon = failed === 0 ? theme.fg("success", "✓") : theme.fg("warning", "⚠");
-      let text = statusIcon + " " +
-        theme.fg("toolTitle", theme.bold("Parallel Subagents")) +
-        theme.fg("dim", ` — ${succeeded}/${total} succeeded (${formatElapsed(elapsed)})`);
-
-      if (expanded) {
-        const summaryText = typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
-        // Skip the header line, show the rest
-        const body = summaryText.split("\n").slice(1).join("\n").trim();
-        if (body) {
-          text += "\n" + theme.fg("text", body);
-        }
-      } else {
-        for (const r of results) {
-          const icon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
-          text += "\n  " + icon + " " + theme.fg("toolTitle", r.name) +
-            theme.fg("dim", ` (${formatElapsed(r.elapsed)})`);
-        }
-        text += " " + theme.fg("muted", `(${keyHint("expandTools", "to expand")})`);
-      }
-
-      return new Text(text, 0, 0);
-    },
-  });
 
   // ── subagents_list tool ──
   shouldRegister("subagents_list") && pi.registerTool({
@@ -1015,11 +841,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return muxUnavailableResult("tab-title");
       }
       try {
-        const isSubagentSession = !!(process.env.PI_SUBAGENT_NAME || process.env.PI_SUBAGENT_AGENT);
         renameCurrentTab(params.title);
-        if (!isSubagentSession) {
-          renameWorkspace(params.title);
-        }
+        renameWorkspace(params.title);
         return {
           content: [{ type: "text", text: `Title set to: ${params.title}` }],
           details: { title: params.title },
@@ -1039,11 +862,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     label: "Resume Subagent",
     description:
       "Resume a previous sub-agent session in a new multiplexer pane. " +
-      "Opens an interactive session from the given session file path. " +
+      "Returns immediately — the resumed session runs in the background and steers results back when done. " +
       "Use when a sub-agent was cancelled or needs follow-up work.",
     promptSnippet:
       "Resume a previous sub-agent session in a new multiplexer pane. " +
-      "Opens an interactive session from the given session file path. " +
+      "Returns immediately — the resumed session runs in the background and steers results back when done. " +
       "Use when a sub-agent was cancelled or needs follow-up work.",
     parameters: Type.Object({
       sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
@@ -1060,53 +883,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       return new Text(text, 0, 0);
     },
 
-    renderResult(result, { expanded, isPartial }, theme) {
+    renderResult(result, _opts, theme) {
       const details = result.details as any;
       const name = details?.name ?? "Resume";
 
-      if (isPartial) {
-        const text =
-          theme.fg("accent", `Switch to the "${name}" terminal. `) +
-          theme.fg("dim", "Exit (Ctrl+D) to return.");
-        return new Text(text, 0, 0);
-      }
-
-      const exitCode = details?.exitCode ?? 0;
-      const elapsed = details?.elapsed != null ? formatElapsed(details.elapsed) : "?";
-      const summaryText =
-        typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
-
-      if (exitCode !== 0) {
-        const text =
-          theme.fg("error", "✗") +
-          " " +
+      if (details?.status === "started") {
+        return new Text(
+          theme.fg("accent", "▸") + " " +
           theme.fg("toolTitle", theme.bold(name)) +
-          theme.fg("dim", ` — failed (exit code ${exitCode})`);
-        return new Text(text, 0, 0);
+          theme.fg("dim", " — resumed"),
+          0, 0
+        );
       }
 
-      const cleanSummary = summaryText.replace(/\n\nSession: .+\nResume: .+$/, "").replace(/\n\nSession: .+$/, "");
-      const preview =
-        expanded || cleanSummary.length <= 120
-          ? cleanSummary
-          : cleanSummary.slice(0, 120) + "…";
-
-      const sessionLine = details?.sessionPath
-        ? "\n" + theme.fg("dim", `Session: ${details.sessionPath}`)
-        : "";
-
-      const text =
-        theme.fg("success", "✓") +
-        " " +
-        theme.fg("toolTitle", theme.bold(name)) +
-        theme.fg("dim", ` — completed (${elapsed})`) +
-        (preview ? "\n" + theme.fg("text", preview) : "") +
-        sessionLine;
-
-      return new Text(text, 0, 0);
+      // Fallback
+      const text = typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
+      return new Text(theme.fg("dim", text), 0, 0);
     },
 
-    async execute(_toolCallId, params, signal, onUpdate) {
+    async execute(_toolCallId, params, _signal, _onUpdate) {
       const name = params.name ?? "Resume";
       const startTime = Date.now();
 
@@ -1124,105 +919,91 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       // Record entry count before resuming so we can extract new messages
       const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
-      let surface: string | null = null;
+      const surface = createSurface(name);
+      await new Promise<void>((resolve) => setTimeout(resolve, 500));
 
-      try {
-        surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, 500));
+      // Build pi resume command
+      const parts = ["pi", "--session", shellEscape(params.sessionPath)];
 
-        // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(params.sessionPath)];
+      // Load subagent-done extension so the agent can self-terminate if needed
+      const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
+      parts.push("-e", shellEscape(subagentDonePath));
 
-        // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
-        parts.push("-e", shellEscape(subagentDonePath));
+      let cleanupMsgFile: string | undefined;
+      if (params.message) {
+        const msgFile = join(tmpdir(), `subagent-resume-${Date.now()}.md`);
+        writeFileSync(msgFile, params.message, "utf8");
+        cleanupMsgFile = msgFile;
+        parts.push(`@${msgFile}`);
+      }
 
-        if (params.message) {
-          // Write follow-up message to a temp file and pass via @file
-          const msgFile = join(tmpdir(), `subagent-resume-${Date.now()}.md`);
-          writeFileSync(msgFile, params.message, "utf8");
-          parts.push(`@${msgFile}`);
-          const command = `${parts.join(" ")}; rm -f ${shellEscape(msgFile)}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
-          sendCommand(surface, command);
-        } else {
-          const command = `${parts.join(" ")}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
-          sendCommand(surface, command);
-        }
+      const command = `${parts.join(" ")}${cleanupMsgFile ? `; rm -f ${shellEscape(cleanupMsgFile)}` : ""}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
+      sendCommand(surface, command);
 
-        const exitCode = await pollForExit(surface, signal ?? new AbortController().signal, {
-          interval: 3000,
-          onTick() {
-            const elapsed = formatElapsed(Math.floor((Date.now() - startTime) / 1000));
-            let sessionEntries: number | undefined;
-            let sessionBytes: number | undefined;
-            try {
-              const stat = statSync(params.sessionPath);
-              const raw = readFileSync(params.sessionPath, "utf8");
-              sessionEntries = raw.split("\n").filter((l) => l.trim()).length;
-              sessionBytes = stat.size;
-            } catch {}
-            onUpdate?.({
-              content: [{ type: "text", text: `${elapsed} elapsed` }],
-              details: {
-                name,
-                sessionPath: params.sessionPath,
-                startTime,
-                phase: "running",
-                sessionEntries,
-                sessionBytes,
-              },
-            });
-          },
-        });
+      // Register as a running subagent for widget tracking
+      const id = Math.random().toString(16).slice(2, 10);
+      const running: RunningSubagent = {
+        id,
+        name,
+        task: params.message ?? "resumed session",
+        surface,
+        startTime,
+        sessionFile: params.sessionPath,
+      };
+      runningSubagents.set(id, running);
+      startWidgetRefresh();
 
-        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      // Fire-and-forget watcher
+      const watcherAbort = new AbortController();
+      running.abortController = watcherAbort;
 
-        // Extract summary from new entries
+      watchSubagent(running, watcherAbort.signal).then((result) => {
+        updateWidget();
         const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
         const summary =
           findLastAssistantMessage(allEntries) ??
-          (exitCode !== 0
-            ? `Resumed session exited with code ${exitCode}`
+          (result.exitCode !== 0
+            ? `Resumed session exited with code ${result.exitCode}`
             : "Resumed session exited without new output");
-
-        closeSurface(surface);
-        surface = null;
-
         const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
 
-        return {
-          content: [{ type: "text", text: `${summary}${sessionRef}` }],
-          details: { name, sessionPath: params.sessionPath, exitCode, elapsed },
-        };
-      } catch (err: any) {
-        if (surface) {
-          try { closeSurface(surface); } catch {}
-          surface = null;
-        }
+        pi.sendMessage({
+          customType: "subagent_result",
+          content: `${summary}${sessionRef}`,
+          display: true,
+          details: {
+            name,
+            task: params.message ?? "resumed session",
+            exitCode: result.exitCode,
+            elapsed: result.elapsed,
+            sessionFile: params.sessionPath,
+          },
+        }, { triggerTurn: true, deliverAs: "steer" });
+      }).catch((err) => {
+        updateWidget();
+        pi.sendMessage({
+          customType: "subagent_result",
+          content: `Resume error: ${err?.message ?? String(err)}`,
+          display: true,
+          details: { name, error: err?.message },
+        }, { triggerTurn: true, deliverAs: "steer" });
+      });
 
-        if (signal?.aborted) {
-          return {
-            content: [{ type: "text", text: "Resume cancelled." }],
-            details: { error: "cancelled" },
-          };
-        }
-
-        return {
-          content: [{ type: "text", text: `Resume error: ${err?.message ?? String(err)}` }],
-          details: { error: err?.message },
-        };
-      }
+      return {
+        content: [{ type: "text", text: `Session "${name}" resumed.` }],
+        details: { id, name, sessionPath: params.sessionPath, status: "started" },
+      };
     },
   });
 
-  // /iterate command — fork the session into an interactive subagent
+  // /iterate command — fork the session into a subagent
   pi.registerCommand("iterate", {
-    description: "Fork session into an interactive subagent for focused work (bugfixes, iteration)",
-    handler: async (args, ctx) => {
+    description: "Fork session into a subagent for focused work (bugfixes, iteration)",
+    handler: async (args, _ctx) => {
       const task = args?.trim() || "";
       const toolCall = task
-        ? `Use subagent to start an interactive iterate session. fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
-        : `Use subagent to start an interactive iterate session. fork: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
+        ? `Use subagent to fork a session. fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
+        : `Use subagent to fork a session. fork: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
       pi.sendUserMessage(toolCall);
     },
   });
@@ -1248,9 +1029,74 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       const taskText = task || `You are the ${agentName} agent. Wait for instructions.`;
-      const toolCall = `Use subagent with agent: "${agentName}", name: "${agentName[0].toUpperCase() + agentName.slice(1)}", interactive: false, task: ${JSON.stringify(taskText)}`;
+      const displayName = agentName[0].toUpperCase() + agentName.slice(1);
+      const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
     },
+  });
+
+  // ── subagent_result message renderer ──
+  pi.registerMessageRenderer("subagent_result", (message, options, theme) => {
+    const details = message.details as any;
+    if (!details) return undefined;
+
+    return {
+      render(width: number): string[] {
+        const name = details.name ?? "subagent";
+        const exitCode = details.exitCode ?? 0;
+        const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
+        const bgFn = exitCode === 0
+          ? (text: string) => theme.bg("toolSuccessBg", text)
+          : (text: string) => theme.bg("toolErrorBg", text);
+        const icon = exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+        const status = exitCode === 0 ? "completed" : `failed (exit ${exitCode})`;
+        const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
+
+        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "—")} ${status} ${theme.fg("dim", `(${elapsed})`)}`;
+        const rawContent = typeof message.content === "string" ? message.content : "";
+
+        // Clean summary (remove session ref and leading label for display)
+        const summary = rawContent
+          .replace(/\n\nSession: .+\nResume: .+$/, "")
+          .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
+          .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "");
+
+        // Build content for the box
+        const contentLines = [header];
+
+        if (options.expanded) {
+          // Full view: complete summary + session info
+          if (summary) {
+            for (const line of summary.split("\n")) {
+              contentLines.push(line.slice(0, width - 6));
+            }
+          }
+          if (details.sessionFile) {
+            contentLines.push("");
+            contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
+            contentLines.push(theme.fg("dim", `Resume:  pi --session ${details.sessionFile}`));
+          }
+        } else {
+          // Collapsed: preview + expand hint
+          if (summary) {
+            const previewLines = summary.split("\n").slice(0, 5);
+            for (const line of previewLines) {
+              contentLines.push(theme.fg("dim", line.slice(0, width - 6)));
+            }
+            const totalLines = summary.split("\n").length;
+            if (totalLines > 5) {
+              contentLines.push(theme.fg("muted", `… ${totalLines - 5} more lines`));
+            }
+          }
+          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
+        }
+
+        // Render via Box for background + padding, with blank line above for separation
+        const box = new Box(1, 1, bgFn);
+        box.addChild(new Text(contentLines.join("\n"), 0, 0));
+        return ["", ...box.render(width)];
+      }
+    };
   });
 
   // /plan command — start the full planning workflow
