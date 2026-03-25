@@ -2,6 +2,9 @@
  * Extension loaded into sub-agents.
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
+ * - Enforces that autonomous subagents call write_artifact and subagent_done
+ *   before their session can end. On agent_end, if these haven't been called,
+ *   a follow-up turn is injected automatically — no idle polling, no nudges.
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
@@ -15,6 +18,13 @@ export default function (pi: ExtensionAPI) {
   // Read subagent identity from env vars (set by parent orchestrator)
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
+
+  // ── Completion enforcement state ──
+  let hasCalledWriteArtifact = false;
+  let hasCalledSubagentDone = false;
+  let isAutonomous = false;
+  let enforcementCount = 0;
+  const MAX_ENFORCEMENT = 3;
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, theme: any) {
     ctx.ui.setWidget(
@@ -77,7 +87,57 @@ export default function (pi: ExtensionAPI) {
       .map((s) => s.trim())
       .filter(Boolean);
 
+    // Detect autonomous subagent: has PI_SUBAGENT_AGENT set (spawned by parent)
+    // and NOT interactive (no PI_SUBAGENT_INTERACTIVE or explicitly "0")
+    const isSubagent = !!(process.env.PI_SUBAGENT_NAME || process.env.PI_SUBAGENT_AGENT);
+    const interactiveFlag = process.env.PI_SUBAGENT_INTERACTIVE;
+    isAutonomous = isSubagent && interactiveFlag !== "1";
+
+    hasCalledWriteArtifact = false;
+    hasCalledSubagentDone = false;
+    enforcementCount = 0;
+
     renderWidget(ctx, null);
+  });
+
+  // Track tool calls
+  pi.on("tool_execution_end", async (event, _ctx) => {
+    if (event.toolName === "write_artifact") {
+      hasCalledWriteArtifact = true;
+    }
+    if (event.toolName === "subagent_done") {
+      hasCalledSubagentDone = true;
+    }
+  });
+
+  // ── Completion enforcement ──
+  // When the agent finishes a turn (agent_end = model stopped generating),
+  // check if it called write_artifact + subagent_done. If not, inject a
+  // follow-up turn that forces it to complete properly.
+  pi.on("agent_end", async (_event, _ctx) => {
+    if (!isAutonomous) return;
+    if (hasCalledSubagentDone) return; // already done
+    if (enforcementCount >= MAX_ENFORCEMENT) return; // give up after N tries
+
+    enforcementCount++;
+
+    const missing: string[] = [];
+    if (!hasCalledWriteArtifact) missing.push("`write_artifact` with your findings/results");
+    if (!hasCalledSubagentDone) missing.push("`subagent_done` to close this session");
+
+    if (missing.length === 0) return;
+
+    const msg = [
+      `[SYSTEM] You stopped without completing your shutdown sequence.`,
+      `You MUST call: ${missing.join(" and ")}.`,
+      ``,
+      `Do it now. Do not explain, do not apologize — just make the calls.`,
+      enforcementCount >= MAX_ENFORCEMENT - 1
+        ? `This is your final warning. Next failure will force-terminate this session.`
+        : ``,
+    ].filter(Boolean).join("\n");
+
+    pi.sendUserMessage(msg, { deliverAs: "followUp" });
   });
 
   // Toggle expand/collapse with Ctrl+J
@@ -98,6 +158,7 @@ export default function (pi: ExtensionAPI) {
       "Your LAST assistant message before calling this becomes the summary returned to the caller.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      hasCalledSubagentDone = true;
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Shutting down subagent session." }],
