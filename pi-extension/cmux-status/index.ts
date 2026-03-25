@@ -128,9 +128,8 @@ export default function (pi: ExtensionAPI) {
       setStatus("pi_cost", formatCost(sessionCost), "dollarsign.circle", GREEN);
     }
 
-    if (!isSubagentSession) {
-      run("notify", "--title", "Needs attention");
-    }
+    // No notification — sidebar status already shows idle state.
+    // Notifications on every agent_end are just noise.
   });
 
   pi.on("turn_end", async (event, ctx) => {
