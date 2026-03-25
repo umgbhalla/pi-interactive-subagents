@@ -21,12 +21,17 @@ Call `subagent()` and it **returns immediately**. The sub-agent runs in its own 
 ╰─────────────────────────────────────────────────╯
 ```
 
-For parallel execution, just call `subagent` multiple times — they all run concurrently:
+For parallel execution, you can still call `subagent` multiple times — they all run concurrently — or use `agent_group` to get one grouped result when the whole batch finishes:
 
 ```typescript
-subagent({ name: "Scout: Auth", agent: "scout", task: "Analyze auth module" })
-subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" })
-// Both return immediately, results steer back independently
+agent_group({
+  name: "Scouting",
+  agents: [
+    { name: "Scout: Auth", agent: "scout", task: "Analyze auth module" },
+    { name: "Scout: DB", agent: "scout", task: "Map database schema" },
+  ],
+})
+// Returns immediately, then steers back one grouped result when both finish
 ```
 
 ## Install
@@ -50,20 +55,26 @@ tmux new -A -s pi 'pi'
 zellij --session pi   # then run: pi
 ```
 
-Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij` to force a specific backend.
+Optional environment variables:
+- `PI_SUBAGENT_MUX=cmux|tmux|zellij` — force a specific backend
+
+On cmux, subagents open in background tabs by default.
 
 ## What's Included
 
 ### Extensions
 
-**Subagents** — 4 tools + 3 commands:
+**Subagents** — tools + 3 commands:
 
-| Tool | Description |
-|------|-------------|
-| `subagent` | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately) |
-| `subagents_list` | List available agent definitions |
-| `set_tab_title` | Update tab/window title to show progress |
-| `subagent_resume` | Resume a previous sub-agent session (async) |
+| Tool | Level | Description |
+|------|-------|-------------|
+| `agent_group` | main | Spawn a batch of sub-agents and collect one grouped result |
+| `subagent` | nested | Spawn a single sub-agent (only available inside a group for one-level nesting) |
+| `active_subagents` | any | List currently running subagents, optionally with recent screen output |
+| `message_subagent` | any | Send a nudge or follow-up message into a running subagent session |
+| `subagents_list` | any | List available agent definitions |
+| `set_tab_title` | any | Update tab/window title to show progress |
+| `subagent_resume` | any | Resume a previous sub-agent session (async) |
 
 | Command | Description |
 |---------|-------------|
@@ -102,7 +113,7 @@ Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global**
 5. Main agent processes result     → continues with new context
 ```
 
-Multiple subagents run concurrently — each steers its result back independently as it finishes. The live widget above the input tracks all running agents:
+Multiple subagents run concurrently. If you call `subagent` repeatedly, each one steers its result back independently as it finishes. If you use `agent_group`, the batch waits and steers back one grouped result at the end. The live widget above the input tracks all running agents:
 
 ```
 ╭─ Subagents ──────────────────────── 3 running ─╮
@@ -122,11 +133,30 @@ Completion messages render with a colored background and are expandable with `Ct
 // Named agent with defaults from agent definition
 subagent({ name: "Scout", agent: "scout", task: "Analyze the codebase..." })
 
+// Batch launch with one grouped completion update
+agent_group({
+  name: "Implementation batch",
+  agents: [
+    { name: "Worker: API", agent: "worker", task: "Implement the API changes" },
+    { name: "Reviewer", agent: "reviewer", task: "Review the current diff" },
+  ],
+})
+
+// Block until the whole batch finishes
+agent_group({
+  name: "Scouting",
+  wait: true,
+  agents: [
+    { name: "Scout: Auth", agent: "scout", task: "Analyze auth" },
+    { name: "Scout: DB", agent: "scout", task: "Analyze database" },
+  ],
+})
+
 // Fork — sub-agent gets full conversation context
 subagent({ name: "Iterate", fork: true, task: "Fix the bug where..." })
 
 // Override agent defaults
-subagent({ name: "Worker", agent: "worker", model: "anthropic/claude-haiku-4-5", task: "Quick fix..." })
+subagent({ name: "Worker", agent: "worker", model: "anthropic/claude-opus-4-6", task: "Quick fix..." })
 
 // Custom working directory
 subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer", task: "..." })
@@ -145,6 +175,22 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `skills` | string | — | Comma-separated skill names |
 | `tools` | string | — | Comma-separated tool names |
 | `cwd` | string | — | Working directory for the sub-agent (see [Role Folders](#role-folders)) |
+
+### Orchestrator control tools
+
+These are intended for the **outer/orchestrator session** so it can supervise active work:
+
+```typescript
+active_subagents({ screenLines: 40 })
+
+message_subagent({
+  target: "Scout: Auth",
+  message: "You look close to done. Write your artifact, summarize findings, then call subagent_done.",
+  screenLines: 30,
+})
+```
+
+Subagents themselves are denied these control tools by default, so only the main session can inspect and nudge sibling agents.
 
 ---
 

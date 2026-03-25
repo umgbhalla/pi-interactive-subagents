@@ -64,18 +64,21 @@ cat package.json 2>/dev/null | head -30
 
 Spend 30–60 seconds. The goal is to give the planner useful context — not to do a full scout.
 
-**If deeper context is needed** (large codebase, unfamiliar architecture), spawn an autonomous scout subagent first:
+**If deeper context is needed** (large codebase, unfamiliar architecture), spawn an autonomous scout first:
 
 ```typescript
-subagent({
-  name: "Scout",
-  agent: "scout",
-  interactive: false,
-  task: "Analyze the codebase. Map file structure, key modules, patterns, and conventions. Summarize findings concisely for a planning session."
+agent_group({
+  name: "🔍 Investigation",
+  wait: true,
+  agents: [{
+    name: "Scout",
+    agent: "scout",
+    task: "Analyze the codebase. Map file structure, key modules, patterns, and conventions. Summarize findings concisely for a planning session."
+  }]
 })
 ```
 
-Read the scout's summary from the subagent result before proceeding.
+Read the scout's summary before proceeding.
 
 ---
 
@@ -84,18 +87,20 @@ Read the scout's summary from the subagent result before proceeding.
 Spawn the interactive planner. The `planner` agent definition has the full brainstorming workflow built in — clarify, explore, validate design, write plan, create todos.
 
 ```typescript
-subagent({
-  name: "Planner",
-  agent: "planner",
-  interactive: true,
-  task: `Plan: [what the user wants to build]
+agent_group({
+  name: "💬 Planning",
+  agents: [{
+    name: "Planner",
+    agent: "planner",
+    task: `Plan: [what the user wants to build]
 
 Context from investigation:
 [paste relevant findings from Phase 1 here]`
+  }]
 })
 ```
 
-**The user works with the planner in the subagent.** The main session waits. When the user is done, they press Ctrl+D and the subagent.s summary is returned to the main session.
+**The user works with the planner in the subagent.** The main session waits. When the user is done, they press Ctrl+D and the subagent's summary is returned to the main session.
 
 ---
 
@@ -118,27 +123,36 @@ Spawn a scout first for context, then workers sequentially:
 
 ```typescript
 // 1. Scout gathers context
-subagent({
-  name: "Scout",
-  agent: "scout",
-  interactive: false,
-  task: "Gather context for implementing [feature]. Read the plan at [plan path]. Identify all files that will be created/modified, map existing patterns and conventions."
+agent_group({
+  name: "🔍 Scout",
+  wait: true,
+  agents: [{
+    name: "Scout",
+    agent: "scout",
+    task: "Gather context for implementing [feature]. Read the plan at [plan path]. Identify all files that will be created/modified, map existing patterns and conventions."
+  }]
 })
 
 // 2. Workers execute todos sequentially — one at a time
-subagent({
-  name: "Worker",
-  agent: "worker",
-  interactive: false,
-  task: "Implement TODO-xxxx. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary]"
+agent_group({
+  name: "🔨 Worker 1/3",
+  wait: true,
+  agents: [{
+    name: "Worker",
+    agent: "worker",
+    task: "Implement TODO-xxxx. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary]"
+  }]
 })
 
 // Check result, then next todo
-subagent({
-  name: "Worker",
-  agent: "worker",
-  interactive: false,
-  task: "Implement TODO-yyyy. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary]"
+agent_group({
+  name: "🔨 Worker 2/3",
+  wait: true,
+  agents: [{
+    name: "Worker",
+    agent: "worker",
+    task: "Implement TODO-yyyy. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary]"
+  }]
 })
 ```
 
@@ -151,11 +165,14 @@ subagent({
 After all todos are complete:
 
 ```typescript
-subagent({
-  name: "Reviewer",
-  agent: "reviewer",
-  interactive: false,
-  task: "Review the recent changes. Plan: [plan path]"
+agent_group({
+  name: "🔎 Review",
+  wait: true,
+  agents: [{
+    name: "Reviewer",
+    agent: "reviewer",
+    task: "Review the recent changes. Plan: [plan path]"
+  }]
 })
 ```
 
