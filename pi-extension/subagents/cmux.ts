@@ -7,6 +7,7 @@ import { basename, join } from "node:path";
 const execFileAsync = promisify(execFile);
 
 export type MuxBackend = "cmux" | "tmux" | "zellij";
+export type SplitDirection = "left" | "right" | "up" | "down";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -161,11 +162,35 @@ async function zellijActionAsync(args: string[], surface?: string): Promise<stri
 }
 
 /**
- * Create a new terminal pane as a right split and set its title.
+ * Create a new terminal surface for a subagent.
+ * Uses a background tab in cmux, and a split pane in tmux/zellij.
  * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij).
  */
 export function createSurface(name: string, options?: { focus?: boolean }): string {
-  return createSurfaceSplit(name, "right", undefined, options);
+  const shouldFocus = options?.focus !== false;
+  const backend = requireMuxBackend();
+
+  if (backend === "cmux") {
+    const out = execSync("cmux new-surface --type terminal", {
+      encoding: "utf8",
+    }).trim();
+    const match = out.match(/surface:\d+/);
+    if (!match) {
+      throw new Error(`Unexpected cmux new-surface output: ${out}`);
+    }
+    const surface = match[0];
+    execSync(`cmux rename-tab --surface ${shellEscape(surface)} ${shellEscape(name)}`, {
+      encoding: "utf8",
+    });
+    if (shouldFocus) {
+      execSync(`cmux focus-panel --panel ${shellEscape(surface)}`, {
+        encoding: "utf8",
+      });
+    }
+    return surface;
+  }
+
+  return createSurfaceSplit(name, "down", undefined, options);
 }
 
 /**
@@ -174,7 +199,7 @@ export function createSurface(name: string, options?: { focus?: boolean }): stri
  */
 export function createSurfaceSplit(
   name: string,
-  direction: "left" | "right" | "up" | "down",
+  direction: SplitDirection,
   fromSurface?: string,
   options?: { focus?: boolean },
 ): string {
