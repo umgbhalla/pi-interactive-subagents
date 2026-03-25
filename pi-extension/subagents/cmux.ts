@@ -167,7 +167,7 @@ async function zellijActionAsync(args: string[], surface?: string): Promise<stri
  * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij).
  */
 export function createSurface(name: string, options?: { focus?: boolean }): string {
-  const shouldFocus = options?.focus !== false;
+  const shouldFocus = options?.focus === true;
   const backend = requireMuxBackend();
 
   if (backend === "cmux") {
@@ -203,7 +203,7 @@ export function createSurfaceSplit(
   fromSurface?: string,
   options?: { focus?: boolean },
 ): string {
-  const shouldFocus = options?.focus !== false;
+  const shouldFocus = options?.focus === true;
   const backend = requireMuxBackend();
 
   if (backend === "cmux") {

@@ -1480,7 +1480,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }, { triggerTurn: true, deliverAs: "steer" });
     });
 
-    ctx.ui.notify(`${label} started`, "info");
+    // Widget already shows the running agent — no notification needed
   }
 
   // /iterate command — fork the session into a subagent
