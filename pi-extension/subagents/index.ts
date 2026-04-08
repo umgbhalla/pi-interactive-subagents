@@ -410,9 +410,12 @@ async function launchSubagent(
   const parts: string[] = ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
 
-  // For fork mode, create a clean copy of the session that excludes
-  // the "Use subagent..." meta-message and tool call that triggered this.
-  // The forked session sees only the original conversation + the user's actual task.
+  // For fork mode, create a cleaned copy of the current session directly at the
+  // deterministic subagent session path. Core pi rejects `--fork` combined with
+  // `--session`, so we materialize the forked history ourselves and then open it
+  // with `--session` only. This preserves deterministic tracking for the parent
+  // orchestrator while still giving the child the full prior conversation context
+  // minus the triggering meta-message/tool call.
   let forkCleanupFile: string | undefined;
   if (params.fork) {
     const raw = readFileSync(sessionFile, "utf8");
@@ -432,9 +435,7 @@ async function launchSubagent(
     }
 
     const cleanLines = lines.slice(0, truncateAt);
-    forkCleanupFile = join(tmpdir(), `pi-fork-clean-${Date.now()}.jsonl`);
-    writeFileSync(forkCleanupFile, cleanLines.join("\n") + "\n", "utf8");
-    parts.push("--fork", shellEscape(forkCleanupFile));
+    writeFileSync(subagentSessionFile, cleanLines.join("\n") + "\n", "utf8");
   }
 
   const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
