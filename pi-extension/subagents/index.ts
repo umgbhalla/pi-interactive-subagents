@@ -765,10 +765,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     description:
       "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
       "Returns immediately — the agent runs in the background and steers results back when done. " +
+      "After launch, inform the user and wait; do not poll unless explicitly asked. " +
       "Supports cmux, tmux, and zellij.",
     promptSnippet:
       "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
       "Returns immediately — the agent runs in the background and steers results back when done. " +
+      "After launch, inform the user and wait; do not poll unless explicitly asked. " +
       "Supports cmux, tmux, and zellij.",
     parameters: SubagentParams,
 
@@ -821,7 +823,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       // Return immediately
       return {
-        content: [{ type: "text", text: `Sub-agent "${params.name}" started.` }],
+        content: [{
+          type: "text",
+          text: `Sub-agent "${params.name}" launched and running in the background. Results will return automatically in this session. Inform the user and wait; only call status/nudge tools if the user explicitly asks.`,
+        }],
         details: {
           id: running.id,
           name: params.name,
@@ -830,6 +835,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           model: running.model,
           modelHint: running.modelHint,
           status: "started",
+          autoReturn: true,
+          nextAction: "Inform user launch succeeded and wait for automatic result.",
         },
       };
     },
@@ -873,7 +880,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return new Text(
           theme.fg("accent", "▸") + " " +
           theme.fg("toolTitle", theme.bold(name)) +
-          theme.fg("dim", " — started"),
+          theme.fg("dim", " — launched (auto-return)"),
           0, 0
         );
       }
@@ -890,10 +897,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     label: "Agent Group",
     description:
       "Spawn a group of sub-agents concurrently and collect their results together. " +
-      "Returns immediately and sends one grouped update when all subagents finish.",
+      "Returns immediately and sends one grouped update when all subagents finish. " +
+      "After launch, inform the user and wait; do not poll unless explicitly asked.",
     promptSnippet:
       "Spawn a group of sub-agents concurrently and collect their results together. " +
-      "Returns immediately and sends one grouped update when all subagents finish.",
+      "Returns immediately and sends one grouped update when all subagents finish. " +
+      "After launch, inform the user and wait; do not poll unless explicitly asked.",
     parameters: AgentGroupParams,
 
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -981,11 +990,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       });
 
       return {
-        content: [{ type: "text", text: `${groupName} started with ${started.length} subagents.` }],
+        content: [{
+          type: "text",
+          text: `${groupName} launched with ${started.length} subagents. The grouped result will return automatically when all are done. Inform the user and wait; only poll or nudge if the user explicitly asks.`,
+        }],
         details: {
           name: groupName,
           status: "started",
           total: started.length,
+          autoReturn: true,
+          nextAction: "Inform user launch succeeded and wait for automatic grouped result.",
           agents: started.map((running) => ({
             id: running.id,
             name: running.name,
@@ -1017,7 +1031,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return new Text(
           theme.fg("accent", "▸") + " " +
           theme.fg("toolTitle", theme.bold(name)) +
-          theme.fg("dim", ` — started (${details.total ?? 0} subagents)`),
+          theme.fg("dim", ` — launched (${details.total ?? 0} subagents, auto-return)`),
           0, 0,
         );
       }
@@ -1338,10 +1352,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     description:
       "Resume a previous sub-agent session in a new multiplexer pane. " +
       "Returns immediately — the resumed session runs in the background and steers results back when done. " +
+      "After launch, inform the user and wait; do not poll unless explicitly asked. " +
       "Use when a sub-agent was cancelled or needs follow-up work.",
     promptSnippet:
       "Resume a previous sub-agent session in a new multiplexer pane. " +
       "Returns immediately — the resumed session runs in the background and steers results back when done. " +
+      "After launch, inform the user and wait; do not poll unless explicitly asked. " +
       "Use when a sub-agent was cancelled or needs follow-up work.",
     parameters: Type.Object({
       sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
@@ -1366,7 +1382,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return new Text(
           theme.fg("accent", "▸") + " " +
           theme.fg("toolTitle", theme.bold(name)) +
-          theme.fg("dim", " — resumed"),
+          theme.fg("dim", " — resumed (auto-return)"),
           0, 0
         );
       }
@@ -1465,8 +1481,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       });
 
       return {
-        content: [{ type: "text", text: `Session "${name}" resumed.` }],
-        details: { id, name, sessionPath: params.sessionPath, status: "started" },
+        content: [{
+          type: "text",
+          text: `Session "${name}" resumed in the background. Results will return automatically in this session. Inform the user and wait; only poll or nudge if the user explicitly asks.`,
+        }],
+        details: {
+          id,
+          name,
+          sessionPath: params.sessionPath,
+          status: "started",
+          autoReturn: true,
+          nextAction: "Inform user resume succeeded and wait for automatic result.",
+        },
       };
     },
   });
