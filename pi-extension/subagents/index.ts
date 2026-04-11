@@ -21,7 +21,9 @@ import {
 import {
   getNewEntries,
   findLastAssistantMessage,
+  writeSanitizedForkSession,
 } from "./session.ts";
+import { resolveHintedModel, type ModelHint } from "./model-hints.ts";
 
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
@@ -33,6 +35,10 @@ const SubagentParams = Type.Object({
     Type.String({ description: "Appended to system prompt (role instructions)" })
   ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  modelHint: Type.Optional(Type.Union([
+    Type.Literal("frontend"),
+    Type.Literal("non-frontend"),
+  ], { description: "Hint for model-family selection. Use 'frontend' for UI/design work (prefers Claude/Sonnet/Opus family), 'non-frontend' for backend/general coding work (prefers Codex/GPT family). Ignored when model is set explicitly." })),
   skills: Type.Optional(Type.String({ description: "Comma-separated skills (overrides agent default)" })),
   tools: Type.Optional(Type.String({ description: "Comma-separated tools (overrides agent default)" })),
   cwd: Type.Optional(Type.String({ description: "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders." })),
@@ -45,7 +51,7 @@ const AgentGroupParams = Type.Object({
     description: "Subagents to launch concurrently. Each entry accepts the same fields as the subagent tool.",
   }),
   name: Type.Optional(Type.String({ description: "Optional label for the group result. Default: 'Agent group'." })),
-  wait: Type.Optional(Type.Boolean({ description: "If true, wait for all subagents and return one combined result in this tool call. Default: false." })),
+  // wait param removed — agent_group is always async
 });
 
 const ActiveSubagentsParams = Type.Object({
@@ -60,6 +66,8 @@ const MessageSubagentParams = Type.Object({
 
 interface AgentDefaults {
   model?: string;
+  frontendModel?: string;
+  nonFrontendModel?: string;
   tools?: string;
   skills?: string;
   thinking?: string;
@@ -117,6 +125,8 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
     const spawningRaw = get("spawning");
     return {
       model: get("model"),
+      frontendModel: get("model-frontend") ?? get("frontend-model"),
+      nonFrontendModel: get("model-non-frontend") ?? get("non-frontend-model") ?? get("model-backend") ?? get("backend-model"),
       tools: get("tools"),
       skills: get("skill") ?? get("skills"),
       thinking: get("thinking"),
@@ -223,6 +233,8 @@ interface RunningSubagent {
   name: string;
   task: string;
   agent?: string;
+  model?: string;
+  modelHint?: ModelHint;
   surface: string;
   startTime: number;
   sessionFile: string;
@@ -362,7 +374,11 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const { model: effectiveModel, modelHint: effectiveModelHint } = resolveHintedModel({
+    explicitModel: params.model,
+    modelHint: params.modelHint,
+    agentDefaults: agentDefs,
+  });
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
@@ -402,8 +418,18 @@ async function launchSubagent(
     `Example: "[${agentType}] Analyzing auth module". Keep it concise.`;
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const roleBlock = identity ? `\n\n${identity}` : "";
+  const typedForkTask = identity
+    ? [
+        "Continue from the current conversation context. For this fork only, adopt the following role and constraints:",
+        identity,
+        tabTitleInstruction,
+        modeHint,
+        params.task,
+        summaryInstruction,
+      ].filter(Boolean).join("\n\n")
+    : params.task;
   const fullTask = params.fork
-    ? params.task
+    ? typedForkTask
     : `${roleBlock}\n\n${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}\n\n${summaryInstruction}`;
 
   // Build pi command
@@ -418,24 +444,7 @@ async function launchSubagent(
   // minus the triggering meta-message/tool call.
   let forkCleanupFile: string | undefined;
   if (params.fork) {
-    const raw = readFileSync(sessionFile, "utf8");
-    const lines = raw.split("\n").filter((l) => l.trim());
-
-    // Walk backwards to find the last user message (the meta-instruction)
-    // and truncate everything from there onwards
-    let truncateAt = lines.length;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      try {
-        const entry = JSON.parse(lines[i]);
-        if (entry.type === "message" && entry.message?.role === "user") {
-          truncateAt = i;
-          break;
-        }
-      } catch {}
-    }
-
-    const cleanLines = lines.slice(0, truncateAt);
-    writeFileSync(subagentSessionFile, cleanLines.join("\n") + "\n", "utf8");
+    writeSanitizedForkSession(sessionFile, subagentSessionFile);
   }
 
   const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
@@ -484,11 +493,11 @@ async function launchSubagent(
     const sessionId = ctx.sessionManager.getSessionId();
     const artifactDir = getArtifactDir(ctx.cwd, sessionId);
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const artifactName = `context/${params.name.toLowerCase().replace(/\s+/g, "-")}-${timestamp}.md`;
+    const artifactName = `context/${params.name.toLowerCase().replace(/[^a-zA-Z0-9._-]/g, "-")}-${timestamp}.md`;
     const artifactPath = join(artifactDir, artifactName);
     mkdirSync(dirname(artifactPath), { recursive: true });
     writeFileSync(artifactPath, fullTask, "utf8");
-    parts.push(`@${artifactPath}`);
+    parts.push(`@${shellEscape(artifactPath)}`);
   }
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths
@@ -507,6 +516,8 @@ async function launchSubagent(
     name: params.name,
     task: params.task,
     agent: params.agent,
+    model: effectiveModel,
+    modelHint: effectiveModelHint,
     surface,
     startTime,
     sessionFile: subagentSessionFile,
@@ -682,6 +693,8 @@ function getRunningSubagentsSnapshot() {
     name: running.name,
     task: running.task,
     agent: running.agent,
+    model: running.model,
+    modelHint: running.modelHint,
     surface: running.surface,
     sessionFile: running.sessionFile,
     elapsed: Math.floor((Date.now() - running.startTime) / 1000),
@@ -814,6 +827,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           name: params.name,
           task: params.task,
           agent: params.agent,
+          model: running.model,
+          modelHint: running.modelHint,
           status: "started",
         },
       };
@@ -821,11 +836,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
     renderCall(args, theme) {
       const agent = args.agent ? theme.fg("dim", ` (${args.agent})`) : "";
+      const hint = args.modelHint ? theme.fg("dim", ` [${args.modelHint}]`) : "";
       const cwdHint = args.cwd ? theme.fg("dim", ` in ${args.cwd}`) : "";
       let text =
         "▸ " +
         theme.fg("toolTitle", theme.bold(args.name ?? "(unnamed)")) +
         agent +
+        hint +
         cwdHint;
 
       // Show a one-line task preview. renderCall is called repeatedly as the
@@ -873,12 +890,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     label: "Agent Group",
     description:
       "Spawn a group of sub-agents concurrently and collect their results together. " +
-      "By default this returns immediately and sends one grouped update when all subagents finish. " +
-      "Set wait=true to block until the full batch completes.",
+      "Returns immediately and sends one grouped update when all subagents finish.",
     promptSnippet:
       "Spawn a group of sub-agents concurrently and collect their results together. " +
-      "By default this returns immediately and sends one grouped update when all subagents finish. " +
-      "Set wait=true to block until the full batch completes.",
+      "Returns immediately and sends one grouped update when all subagents finish.",
     parameters: AgentGroupParams,
 
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -935,7 +950,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return results;
       };
 
-      if (params.wait) {
+      if (false) {
         const results = await waitForAll();
         const completed = results.filter((r) => r.exitCode === 0).length;
         const failed = results.length - completed;
@@ -976,6 +991,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             name: running.name,
             task: running.task,
             agent: running.agent,
+            model: running.model,
+            modelHint: running.modelHint,
           })),
         },
       };
@@ -1067,6 +1084,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           `  session: ${agent.sessionFile}`,
           `  task: ${agent.task}`,
         ];
+        if (agent.modelHint) {
+          lines.push(`  model hint: ${agent.modelHint}`);
+        }
+        if (agent.model) {
+          lines.push(`  model: ${agent.model}`);
+        }
         if (agent.entries != null || agent.bytes != null) {
           lines.push(`  progress: ${agent.entries ?? 0} msgs, ${formatBytes(agent.bytes ?? 0)}`);
         }
@@ -1386,7 +1409,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const msgFile = join(tmpdir(), `subagent-resume-${Date.now()}.md`);
         writeFileSync(msgFile, params.message, "utf8");
         cleanupMsgFile = msgFile;
-        parts.push(`@${msgFile}`);
+        parts.push(`@${shellEscape(msgFile)}`);
       }
 
       const command = `${parts.join(" ")}${cleanupMsgFile ? `; rm -f ${shellEscape(cleanupMsgFile)}` : ""}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
@@ -1486,26 +1509,45 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // /iterate command — fork the session into a subagent
   pi.registerCommand("iterate", {
-    description: "Fork session into a subagent for focused work (bugfixes, iteration)",
+    description: "Fork session into a subagent for focused work. Usage: /iterate [--agent <name>] <task>",
     handler: async (args, ctx) => {
-      const task = (args ?? "").trim() || "The user wants to do some hands-on work. Help them with whatever they need.";
-      await launchFromCommand({ name: "Iterate", task, fork: true }, ctx, "Iterate");
+      const trimmed = (args ?? "").trim();
+      const agentMatch = trimmed.match(/^--agent\s+(\S+)\s*(.*)$/);
+      const agent = agentMatch?.[1];
+      const task = (agentMatch?.[2] ?? trimmed).trim() || "The user wants to do some hands-on work. Help them with whatever they need.";
+      await launchFromCommand(
+        { name: agent ?? "Iterate", agent, task, fork: true },
+        ctx,
+        agent ? `Iterate:${agent}` : "Iterate",
+      );
     },
   });
 
   // /subagent command — spawn a subagent by name
   pi.registerCommand("subagent", {
-    description: "Spawn a subagent: /subagent <agent> <task>",
+    description: "Spawn a subagent: /subagent <agent> [--hint frontend|non-frontend] <task>",
     handler: async (args, ctx) => {
       const trimmed = (args ?? "").trim();
       if (!trimmed) {
-        ctx.ui.notify("Usage: /subagent <agent> [task]", "warning");
+        ctx.ui.notify("Usage: /subagent <agent> [--hint frontend|non-frontend] [task]", "warning");
         return;
       }
 
       const spaceIdx = trimmed.indexOf(" ");
       const agentName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
-      const task = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+      let rest = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+
+      let modelHint: ModelHint | undefined;
+      const hintMatch = rest.match(/(?:^|\s)--hint\s+(frontend|non-frontend|front-end|non-front-end|ui|ux|design|backend|general|code|coding)(?=\s|$)/i);
+      if (hintMatch) {
+        const hinted = resolveHintedModel({ modelHint: hintMatch[1] }).modelHint;
+        if (!hinted) {
+          ctx.ui.notify(`Unknown model hint: ${hintMatch[1]}`, "warning");
+          return;
+        }
+        modelHint = hinted;
+        rest = `${rest.slice(0, hintMatch.index)} ${rest.slice((hintMatch.index ?? 0) + hintMatch[0].length)}`.trim();
+      }
 
       const defs = loadAgentDefaults(agentName);
       if (!defs) {
@@ -1513,9 +1555,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return;
       }
 
-      const taskText = task || `You are the ${agentName} agent. Wait for instructions.`;
+      const taskText = rest || `You are the ${agentName} agent. Wait for instructions.`;
       const displayName = agentName[0].toUpperCase() + agentName.slice(1);
-      await launchFromCommand({ name: displayName, agent: agentName, task: taskText }, ctx, displayName);
+      await launchFromCommand({ name: displayName, agent: agentName, task: taskText, modelHint }, ctx, displayName);
     },
   });
 

@@ -1,6 +1,6 @@
-import { readFileSync, appendFileSync, copyFileSync } from "node:fs";
+import { readFileSync, appendFileSync, copyFileSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { join, dirname } from "node:path";
+import { join } from "node:path";
 
 export interface SessionEntry {
   type: string;
@@ -9,13 +9,35 @@ export interface SessionEntry {
   [key: string]: unknown;
 }
 
+type MessageRole = "user" | "assistant" | "toolResult";
+
+type MessageContentBlock = {
+  type: string;
+  text?: string;
+  name?: string;
+  [key: string]: unknown;
+};
+
 export interface MessageEntry extends SessionEntry {
   type: "message";
   message: {
-    role: "user" | "assistant" | "toolResult";
-    content: Array<{ type: string; text?: string; [key: string]: unknown }>;
+    role: MessageRole;
+    content: MessageContentBlock[];
+    [key: string]: unknown;
   };
 }
+
+const OMIT_FORK_TOOL_RESULTS = new Set([
+  "set_tab_title",
+  "active_subagents",
+  "message_subagent",
+  "subagent",
+  "agent_group",
+  "subagents_list",
+  "subagent_resume",
+]);
+const MAX_FORK_TOOL_RESULT_LINES = 16;
+const MAX_FORK_TOOL_RESULT_CHARS = 1200;
 
 function readEntries(sessionFile: string): SessionEntry[] {
   const raw = readFileSync(sessionFile, "utf8");
@@ -23,6 +45,98 @@ function readEntries(sessionFile: string): SessionEntry[] {
     .split("\n")
     .filter((line) => line.trim())
     .map((line) => JSON.parse(line) as SessionEntry);
+}
+
+function truncateText(text: string, maxLines = MAX_FORK_TOOL_RESULT_LINES, maxChars = MAX_FORK_TOOL_RESULT_CHARS): string {
+  const lines = text.split("\n").slice(0, maxLines);
+  const joined = lines.join("\n");
+  return joined.length > maxChars ? `${joined.slice(0, maxChars - 1)}…` : joined;
+}
+
+function extractTextBlocks(content: unknown): MessageContentBlock[] {
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter((block): block is MessageContentBlock => !!block && typeof block === "object" && block.type === "text" && typeof block.text === "string")
+    .map((block) => ({ type: "text", text: block.text }));
+}
+
+function summarizeAssistantToolCalls(content: unknown): string | null {
+  if (!Array.isArray(content)) return null;
+  const names = [...new Set(
+    content
+      .filter((block): block is MessageContentBlock => !!block && typeof block === "object" && block.type === "toolCall" && typeof block.name === "string")
+      .map((block) => block.name as string)
+  )];
+  if (names.length === 0) return null;
+  return names.length === 1
+    ? `[Assistant called tool: ${names[0]}]`
+    : `[Assistant called tools: ${names.join(", ")}]`;
+}
+
+function sanitizeMessageEntryForFork(entry: SessionEntry): SessionEntry {
+  if (entry.type !== "message") return entry;
+
+  const message = (entry as MessageEntry).message;
+  const textBlocks = extractTextBlocks(message.content);
+
+  if (message.role === "assistant") {
+    const summarizedToolCall = summarizeAssistantToolCalls(message.content);
+    const content = textBlocks.length > 0
+      ? textBlocks
+      : summarizedToolCall
+        ? [{ type: "text", text: summarizedToolCall }]
+        : [];
+    return {
+      ...entry,
+      message: {
+        role: "assistant",
+        content,
+      },
+    };
+  }
+
+  if (message.role === "toolResult") {
+    const toolName = typeof message.toolName === "string" ? message.toolName : "tool";
+    const summary = OMIT_FORK_TOOL_RESULTS.has(toolName)
+      ? `[${toolName} output omitted]`
+      : textBlocks.length > 0
+        ? truncateText(textBlocks.map((block) => block.text).join("\n").trim())
+        : `[${toolName} output omitted]`;
+
+    return {
+      ...entry,
+      message: {
+        role: "toolResult",
+        toolName,
+        isError: Boolean(message.isError),
+        content: [{ type: "text", text: summary }],
+      },
+    };
+  }
+
+  return {
+    ...entry,
+    message: {
+      role: "user",
+      content: textBlocks.length > 0 ? textBlocks : [],
+    },
+  };
+}
+
+export function writeSanitizedForkSession(sessionFile: string, destFile: string): void {
+  const entries = readEntries(sessionFile);
+  let truncateAt = entries.length;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type === "message" && (entry as MessageEntry).message.role === "user") {
+      truncateAt = i;
+      break;
+    }
+  }
+
+  const sanitized = entries.slice(0, truncateAt).map(sanitizeMessageEntryForFork);
+  const content = sanitized.map((entry) => JSON.stringify(entry)).join("\n");
+  writeFileSync(destFile, content ? `${content}\n` : "", "utf8");
 }
 
 /**

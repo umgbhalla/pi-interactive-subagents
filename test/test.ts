@@ -12,9 +12,15 @@ import {
   appendBranchSummary,
   copySessionFile,
   mergeNewEntries,
+  writeSanitizedForkSession,
 } from "../pi-extension/subagents/session.ts";
 
 import { shellEscape, isCmuxAvailable } from "../pi-extension/subagents/cmux.ts";
+import {
+  modelMatchesHintFamily,
+  normalizeModelHint,
+  resolveHintedModel,
+} from "../pi-extension/subagents/model-hints.ts";
 
 // --- Helpers ---
 
@@ -70,6 +76,39 @@ const TOOL_RESULT = {
     toolCallId: "tc-001",
     toolName: "bash",
     content: [{ type: "text", text: "output here" }],
+  },
+};
+const ASSISTANT_TOOL_ONLY = {
+  type: "message",
+  id: "asst-tool-001",
+  parentId: "user-001",
+  message: {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "Let me think...", thinkingSignature: "abc123" },
+      { type: "toolCall", id: "toolu_1", name: "active_subagents", arguments: { screenLines: 50 } },
+    ],
+  },
+};
+const NOISY_TOOL_RESULT = {
+  type: "message",
+  id: "tool-noisy-001",
+  parentId: "asst-tool-001",
+  message: {
+    role: "toolResult",
+    toolCallId: "tc-002",
+    toolName: "active_subagents",
+    content: [{ type: "text", text: "very noisy active subagent payload" }],
+    details: { agents: [{ screen: "raw terminal dump" }] },
+  },
+};
+const FINAL_META_USER = {
+  type: "message",
+  id: "user-meta-001",
+  parentId: "asst-002",
+  message: {
+    role: "user",
+    content: [{ type: "text", text: "Spawn a subagent for this task" }],
   },
 };
 
@@ -217,6 +256,153 @@ describe("session.ts", () => {
       // Target should now have 3 entries
       const targetLines = readFileSync(targetFile, "utf8").trim().split("\n");
       assert.equal(targetLines.length, 3);
+    });
+  });
+
+  describe("writeSanitizedForkSession", () => {
+    it("drops the triggering user message and strips noisy assistant/tool payloads", () => {
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        USER_MSG,
+        ASSISTANT_TOOL_ONLY,
+        NOISY_TOOL_RESULT,
+        ASSISTANT_MSG_2,
+        FINAL_META_USER,
+      ]);
+      const out = join(dir, "fork-sanitized.jsonl");
+
+      writeSanitizedForkSession(file, out);
+
+      const entries = readFileSync(out, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      assert.equal(entries.length, 5);
+      assert.equal(entries.at(-1)?.id, "asst-002");
+
+      const assistantTool = entries[2];
+      assert.deepEqual(assistantTool.message.content, [{ type: "text", text: "[Assistant called tool: active_subagents]" }]);
+
+      const noisyTool = entries[3];
+      assert.equal(noisyTool.message.toolName, "active_subagents");
+      assert.equal(noisyTool.message.content[0].text, "[active_subagents output omitted]");
+      assert.equal(noisyTool.message.details, undefined);
+
+      const assistantText = entries[4];
+      assert.deepEqual(assistantText.message.content, [{ type: "text", text: "Updated plan with details." }]);
+    });
+
+    it("keeps regular tool output but truncates and removes extra metadata", () => {
+      const longOutput = Array.from({ length: 40 }, (_, i) => `line ${i}`).join("\n");
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        USER_MSG,
+        {
+          type: "message",
+          id: "tool-long-001",
+          parentId: "user-001",
+          message: {
+            role: "toolResult",
+            toolCallId: "tc-long",
+            toolName: "bash",
+            content: [{ type: "text", text: longOutput }],
+            details: { raw: true },
+            timestamp: 123,
+          },
+        },
+        FINAL_META_USER,
+      ]);
+      const out = join(dir, "fork-sanitized-long.jsonl");
+
+      writeSanitizedForkSession(file, out);
+
+      const entries = readFileSync(out, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      const tool = entries[2];
+      assert.equal(tool.message.toolName, "bash");
+      assert.equal(tool.message.details, undefined);
+      assert.equal(tool.message.toolCallId, undefined);
+      assert.equal(tool.message.timestamp, undefined);
+      assert.match(tool.message.content[0].text, /^line 0/);
+      assert.ok(!tool.message.content[0].text.includes("line 39"));
+    });
+  });
+});
+
+describe("model-hints.ts", () => {
+  describe("normalizeModelHint", () => {
+    it("normalizes frontend aliases", () => {
+      assert.equal(normalizeModelHint("frontend"), "frontend");
+      assert.equal(normalizeModelHint("UI"), "frontend");
+      assert.equal(normalizeModelHint("design"), "frontend");
+    });
+
+    it("normalizes non-frontend aliases", () => {
+      assert.equal(normalizeModelHint("non-frontend"), "non-frontend");
+      assert.equal(normalizeModelHint("backend"), "non-frontend");
+      assert.equal(normalizeModelHint("coding"), "non-frontend");
+    });
+
+    it("returns undefined for unknown hints", () => {
+      assert.equal(normalizeModelHint("mobile"), undefined);
+    });
+  });
+
+  describe("modelMatchesHintFamily", () => {
+    it("matches anthropic models for frontend work", () => {
+      assert.equal(modelMatchesHintFamily("anthropic/claude-sonnet-4-6", "frontend"), true);
+      assert.equal(modelMatchesHintFamily("openai-codex/gpt-5.4", "frontend"), false);
+    });
+
+    it("matches codex/gpt models for non-frontend work", () => {
+      assert.equal(modelMatchesHintFamily("openai-codex/gpt-5.4", "non-frontend"), true);
+      assert.equal(modelMatchesHintFamily("anthropic/claude-opus-4-6", "non-frontend"), false);
+    });
+  });
+
+  describe("resolveHintedModel", () => {
+    it("keeps explicit model overrides", () => {
+      const resolved = resolveHintedModel({
+        explicitModel: "anthropic/claude-opus-4-6",
+        modelHint: "non-frontend",
+        agentDefaults: { model: "openai-codex/gpt-5.4" },
+      });
+      assert.deepEqual(resolved, {
+        model: "anthropic/claude-opus-4-6",
+        modelHint: "non-frontend",
+      });
+    });
+
+    it("uses hint-specific agent overrides first", () => {
+      const resolved = resolveHintedModel({
+        modelHint: "frontend",
+        agentDefaults: {
+          model: "openai-codex/gpt-5.4",
+          frontendModel: "anthropic/claude-opus-4-6",
+        },
+      });
+      assert.deepEqual(resolved, {
+        model: "anthropic/claude-opus-4-6",
+        modelHint: "frontend",
+      });
+    });
+
+    it("reuses agent default when it already matches the hinted family", () => {
+      const resolved = resolveHintedModel({
+        modelHint: "non-frontend",
+        agentDefaults: { model: "openai-codex/gpt-5.3-codex" },
+      });
+      assert.deepEqual(resolved, {
+        model: "openai-codex/gpt-5.3-codex",
+        modelHint: "non-frontend",
+      });
+    });
+
+    it("falls back to package defaults when the agent default is the wrong family", () => {
+      const resolved = resolveHintedModel({
+        modelHint: "non-frontend",
+        agentDefaults: { model: "anthropic/claude-opus-4-6" },
+      });
+      assert.deepEqual(resolved, {
+        model: "openai-codex/gpt-5.4",
+        modelHint: "non-frontend",
+      });
     });
   });
 });

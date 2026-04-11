@@ -80,7 +80,7 @@ On cmux, subagents open in background tabs by default.
 |---------|-------------|
 | `/plan` | Start a full planning workflow |
 | `/iterate` | Fork into a subagent for quick fixes |
-| `/subagent <agent> <task>` | Spawn a named agent directly |
+| `/subagent <agent> [--hint frontend\|non-frontend] <task>` | Spawn a named agent directly |
 
 **Session Artifacts** — 2 tools for session-scoped file storage:
 
@@ -155,8 +155,15 @@ agent_group({
 // Fork — sub-agent gets full conversation context
 subagent({ name: "Iterate", fork: true, task: "Fix the bug where..." })
 
+// Typed fork — keep full current context, but adopt the named agent role
+subagent({ name: "Debugger", agent: "debugger", fork: true, task: "Reproduce and fix the flaky test" })
+
 // Override agent defaults
 subagent({ name: "Worker", agent: "worker", model: "anthropic/claude-opus-4-6", task: "Quick fix..." })
+
+// Hint the model family without hardcoding an exact model
+subagent({ name: "Worker", agent: "worker", modelHint: "frontend", task: "Polish the pricing page UI" })
+subagent({ name: "Worker", agent: "worker", modelHint: "non-frontend", task: "Refactor the queue worker retry logic" })
 
 // Custom working directory
 subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer", task: "..." })
@@ -169,8 +176,9 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `name` | string | required | Display name (shown in widget and pane title) |
 | `task` | string | required | Task prompt for the sub-agent |
 | `agent` | string | — | Load defaults from agent definition |
-| `fork` | boolean | `false` | Copy current session for full context |
+| `fork` | boolean | `false` | Copy current session for full context. When combined with `agent`, this becomes a typed fork: current context + named agent role |
 | `model` | string | — | Override agent's default model |
+| `modelHint` | `frontend` \| `non-frontend` | — | Hint the model family. `frontend` prefers Claude/Sonnet/Opus-style models; `non-frontend` prefers Codex/GPT-style models. Ignored when `model` is set. |
 | `systemPrompt` | string | — | Append to system prompt |
 | `skills` | string | — | Comma-separated skill names |
 | `tools` | string | — | Comma-separated tool names |
@@ -225,9 +233,10 @@ For quick, focused work without polluting the main session's context.
 
 ```
 /iterate Fix the off-by-one error in the pagination logic
+/iterate --agent debugger Reproduce and fix the off-by-one error in the pagination logic
 ```
 
-This forks the current session into a subagent with full conversation context. Make the fix, verify it, and exit to return. The main session gets a summary of what was done.
+This forks the current session into a subagent with full conversation context. With no agent, it's a raw self-fork. With `--agent`, it's a typed fork: the fork keeps the current conversation but adopts that agent's role, model, tools, and constraints. The main session gets a summary of what was done.
 
 ---
 
@@ -257,6 +266,8 @@ You are a specialized agent that does X...
 | `name` | string | Agent name (used in `agent: "my-agent"`) |
 | `description` | string | Shown in `subagents_list` output |
 | `model` | string | Default model (e.g. `anthropic/claude-sonnet-4-6`) |
+| `model-frontend` / `frontend-model` | string | Optional model override used when `modelHint: "frontend"` |
+| `model-non-frontend` / `non-frontend-model` | string | Optional model override used when `modelHint: "non-frontend"` |
 | `thinking` | string | Thinking level: `minimal`, `medium`, `high` |
 | `tools` | string | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls` |
 | `skills` | string | Comma-separated skill names to auto-load |
