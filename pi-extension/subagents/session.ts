@@ -80,12 +80,20 @@ function sanitizeMessageEntryForFork(entry: SessionEntry): SessionEntry {
   const textBlocks = extractTextBlocks(message.content);
 
   if (message.role === "assistant") {
-    const summarizedToolCall = summarizeAssistantToolCalls(message.content);
-    const content = textBlocks.length > 0
-      ? textBlocks
-      : summarizedToolCall
-        ? [{ type: "text", text: summarizedToolCall }]
-        : [];
+    // Keep text blocks + stripped toolCall blocks (id & name only, no arguments).
+    // Providers require every tool_result to match a tool_use in the preceding
+    // assistant message, so we must preserve toolCall stubs.
+    const toolCallStubs = Array.isArray(message.content)
+      ? message.content
+          .filter((block): block is MessageContentBlock => !!block && typeof block === "object" && block.type === "toolCall" && typeof block.id === "string")
+          .map((block) => ({ type: "toolCall", id: block.id, name: block.name ?? "tool", arguments: {} }))
+      : [];
+    const content = [...textBlocks, ...toolCallStubs];
+    // If nothing left, add a placeholder so the message isn't empty
+    if (content.length === 0) {
+      const summary = summarizeAssistantToolCalls(message.content);
+      if (summary) content.push({ type: "text", text: summary });
+    }
     return {
       ...entry,
       message: {
