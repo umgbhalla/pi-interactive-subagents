@@ -192,23 +192,37 @@ async function zellijActionAsync(args: string[], surface?: string): Promise<stri
 
 /**
  * Result from `sp tab new --json` or `sp pane split --json`.
- * Contains 1-based indices used to construct pane selectors (space/tab/pane).
+ * Contains both 1-based indices and stable UUIDs.
+ * We use UUIDs as surface identifiers because positional indices shift when
+ * tabs are closed — which breaks references to still-running subagent panes.
  */
 interface SpCreateResult {
   windowIndex: number;
   spaceIndex: number;
   tabIndex: number;
   paneIndex: number;
+  paneID: string;
+  tabID: string;
+  spaceID: string;
   [key: string]: unknown;
 }
 
-/** Build a pane selector string: "space/tab/pane" (1-based). */
+/**
+ * Build a stable pane selector.
+ * Prefers the UUID (survives tab close/reorder); falls back to
+ * "space/tab/pane" indices for older Supaterm versions without UUIDs.
+ */
 function spPaneSelector(result: SpCreateResult): string {
+  if (result.paneID) return result.paneID;
   return `${result.spaceIndex}/${result.tabIndex}/${result.paneIndex}`;
 }
 
-/** Build a tab selector string: "space/tab" (1-based). */
+/**
+ * Build a stable tab selector.
+ * Prefers the UUID; falls back to "space/tab" indices.
+ */
 function spTabSelector(result: SpCreateResult): string {
+  if (result.tabID) return result.tabID;
   return `${result.spaceIndex}/${result.tabIndex}`;
 }
 
