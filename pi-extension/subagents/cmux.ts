@@ -191,7 +191,7 @@ async function zellijActionAsync(args: string[], surface?: string): Promise<stri
 // ── Supaterm helpers ────────────────────────────────────────────────────
 
 /**
- * Result from `sp tab new --output json` or `sp pane split --output json`.
+ * Result from `sp tab new --json` or `sp pane split --json`.
  * Contains 1-based indices used to construct pane selectors (space/tab/pane).
  */
 interface SpCreateResult {
@@ -235,7 +235,7 @@ export function muxCliPromptSnippet(): string | null {
       "  sp pane notify [--title T] [--body B]  — desktop notification",
       "  sp tree                                — show full terminal topology",
       "Target selectors are 1-based: space/tab/pane (e.g. 1/2/1).",
-      "Output modes: --output json | --output plain | (default: human).",
+      "Output modes: --json | --plain | (default: human).",
     ].join("\n");
   }
 
@@ -269,7 +269,7 @@ export function createSurface(name: string, options?: { focus?: boolean }): stri
   const backend = requireMuxBackend();
 
   if (backend === "supaterm") {
-    const args = ["tab", "new", "--output", "json"];
+    const args = ["tab", "new", "--json"];
     if (shouldFocus) args.push("--focus");
     const result: SpCreateResult = JSON.parse(
       execFileSync(spBin(), args, { encoding: "utf8" }).trim()
@@ -321,7 +321,7 @@ export function createSurfaceSplit(
     const args = ["pane", "split", direction];
     if (!shouldFocus) args.push("--no-focus");
     if (fromSurface) args.push("--in", fromSurface);
-    args.push("--output", "json");
+    args.push("--json");
     const result: SpCreateResult = JSON.parse(
       execFileSync(spBin(), args, { encoding: "utf8" }).trim()
     );
