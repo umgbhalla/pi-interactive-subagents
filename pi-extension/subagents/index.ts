@@ -1517,6 +1517,200 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
+  // ── selffork tool (main session only — blocking parallel fork) ──
+  shouldRegister("selffork") && !isInsideSubagent && pi.registerTool({
+    name: "selffork",
+    label: "Self-Fork",
+    description:
+      "Fork the current session into parallel tracks that run concurrently. " +
+      "Each track gets a full copy of the conversation context and works independently in its own terminal pane. " +
+      "This tool BLOCKS until all tracks complete, then returns their combined results. " +
+      "Use when multiple independent workstreams can proceed in parallel from the current state.",
+    promptSnippet:
+      "Fork the current session into parallel tracks. Each track gets full conversation context. " +
+      "BLOCKS until all tracks complete. Returns combined results. " +
+      "Use for parallel independent workstreams.",
+    parameters: SelfForkParams,
+
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      if (!isMuxAvailable()) {
+        return muxUnavailableResult("subagents");
+      }
+
+      const sessionFile = ctx.sessionManager.getSessionFile();
+      if (!sessionFile) {
+        return {
+          content: [{ type: "text", text: "Error: no session file. Start pi with a persistent session to use selffork." }],
+          details: { error: "no session file" },
+        };
+      }
+
+      const trackCount = params.tracks.length;
+      const started: RunningSubagent[] = [];
+
+      // Launch all forks
+      for (let i = 0; i < trackCount; i++) {
+        const track = params.tracks[i];
+        const otherTracks = params.tracks
+          .filter((_, j) => j !== i)
+          .map((t) => t.name)
+          .join(", ");
+
+        const forkPrompt = [
+          `You are fork "${track.name}" (${i + 1}/${trackCount}).`,
+          `Your task: ${track.prompt}`,
+          `Other tracks running in parallel: ${otherTracks}.`,
+          `Work independently on your track only. Do not attempt work belonging to the other tracks.`,
+          `When done, write a concise summary of what you accomplished and any changes you made.`,
+        ].join("\n\n");
+
+        const running = await launchSubagent(
+          {
+            name: `Fork: ${track.name}`,
+            task: forkPrompt,
+            fork: true,
+            model: params.model,
+            modelHint: params.modelHint,
+          },
+          ctx,
+        );
+        const watcherAbort = new AbortController();
+        running.abortController = watcherAbort;
+
+        // Propagate parent abort to each watcher
+        if (signal) {
+          signal.addEventListener("abort", () => watcherAbort.abort(), { once: true });
+        }
+
+        started.push(running);
+      }
+
+      startWidgetRefresh();
+
+      // Block: await ALL forks
+      const results: SubagentResult[] = [];
+      for (let i = 0; i < started.length; i++) {
+        const running = started[i];
+        const result = await watchSubagent(running, running.abortController!.signal);
+        results.push(result);
+        updateWidget();
+
+        // Stream progress back
+        const done = results.length;
+        const remaining = trackCount - done;
+        onUpdate?.({
+          content: [{
+            type: "text",
+            text: `selffork: ${done}/${trackCount} tracks done${remaining > 0 ? `, ${remaining} running...` : ", all complete."}`,
+          }],
+          details: { done, total: trackCount, results: [...results] },
+        });
+      }
+
+      // Build combined output
+      const successCount = results.filter((r) => r.exitCode === 0).length;
+      const maxElapsed = results.reduce((max, r) => Math.max(max, r.elapsed), 0);
+      const sections = results.map((r, i) => {
+        const track = params.tracks[i];
+        const status = r.exitCode === 0 ? "completed" : `FAILED (exit ${r.exitCode})`;
+        const sessionRef = r.sessionFile
+          ? `\nSession: ${r.sessionFile}\nResume: pi --session ${r.sessionFile}`
+          : "";
+        return `## Fork: ${track.name} [${status}] (${formatElapsed(r.elapsed)})\n\n${r.summary || "(no output)"}${sessionRef}`;
+      });
+
+      const header = `Self-fork completed: ${successCount}/${trackCount} succeeded. Wall time: ${formatElapsed(maxElapsed)}.`;
+      const combined = `${header}\n\n${sections.join("\n\n---\n\n")}`;
+
+      return {
+        content: [{ type: "text", text: combined }],
+        details: {
+          mode: "selffork",
+          total: trackCount,
+          completed: successCount,
+          failed: trackCount - successCount,
+          elapsed: maxElapsed,
+          results: results.map((r, i) => ({
+            name: params.tracks[i].name,
+            task: params.tracks[i].prompt,
+            exitCode: r.exitCode,
+            elapsed: r.elapsed,
+            sessionFile: r.sessionFile,
+            summary: r.summary,
+          })),
+        },
+      };
+    },
+
+    renderCall(args, theme) {
+      const tracks = Array.isArray(args.tracks) ? args.tracks : [];
+      let text =
+        "▸ " +
+        theme.fg("toolTitle", theme.bold("selffork ")) +
+        theme.fg("accent", `${tracks.length} tracks`);
+      for (const t of tracks.slice(0, 5)) {
+        const preview = (t.prompt ?? "").length > 60 ? (t.prompt ?? "").slice(0, 60) + "…" : (t.prompt ?? "");
+        text += `\n  ${theme.fg("accent", t.name ?? "?")}${theme.fg("dim", ` ${preview}`)}`;
+      }
+      if (tracks.length > 5) text += `\n  ${theme.fg("muted", `... +${tracks.length - 5} more`)}`;
+      return new Text(text, 0, 0);
+    },
+
+    renderResult(result, { expanded }, theme) {
+      const details = result.details as any;
+      if (!details?.results) {
+        const text = typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      }
+
+      const failed = details.failed ?? 0;
+      const completed = details.completed ?? 0;
+      const total = details.total ?? completed + failed;
+      const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
+      const icon = failed === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+      const status = failed === 0
+        ? `${completed}/${total} succeeded`
+        : `${completed}/${total} succeeded, ${failed} failed`;
+
+      const header = `${icon} ${theme.fg("toolTitle", theme.bold("selffork"))} — ${status} ${theme.fg("dim", `(${elapsed})`)}`;
+
+      if (expanded) {
+        const container = new Container();
+        container.addChild(new Text(header, 0, 0));
+
+        for (const r of details.results) {
+          const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+          container.addChild(new Spacer(1));
+          container.addChild(
+            new Text(
+              `${theme.fg("muted", "─── ")}${theme.fg("accent", r.name)} ${rIcon} ${theme.fg("dim", `(${formatElapsed(r.elapsed)})`)}`,
+              0, 0
+            )
+          );
+          if (r.summary) {
+            const lines = r.summary.split("\n");
+            container.addChild(new Text(lines.join("\n"), 0, 0));
+          }
+          if (r.sessionFile) {
+            container.addChild(new Text(theme.fg("dim", `Session: ${r.sessionFile}`), 0, 0));
+          }
+        }
+        return container;
+      }
+
+      // Collapsed: header + per-track one-liner
+      let text = header;
+      for (const r of details.results) {
+        const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+        const preview = (r.summary ?? "").split("\n")[0] ?? "";
+        const truncated = preview.length > 80 ? preview.slice(0, 80) + "…" : preview;
+        text += `\n  ${rIcon} ${theme.fg("accent", r.name)} ${theme.fg("dim", truncated)}`;
+      }
+      text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
+      return new Text(text, 0, 0);
+    },
+  });
+
   // Helper: launch a subagent directly from a command (bypasses model tool call)
   async function launchFromCommand(
     params: typeof SubagentParams.static,
