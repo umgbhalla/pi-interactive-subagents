@@ -91,6 +91,13 @@ function sanitizeMessageEntryForFork(entry: SessionEntry): SessionEntry {
       message: {
         role: "assistant",
         content,
+        // Preserve fields pi needs for session replay (usage tracking, model info)
+        ...(message.usage != null ? { usage: message.usage } : {}),
+        ...(message.model != null ? { model: message.model } : {}),
+        ...(message.api != null ? { api: message.api } : {}),
+        ...(message.provider != null ? { provider: message.provider } : {}),
+        ...(message.stopReason != null ? { stopReason: message.stopReason } : {}),
+        ...(message.timestamp != null ? { timestamp: message.timestamp } : {}),
       },
     };
   }
@@ -110,6 +117,9 @@ function sanitizeMessageEntryForFork(entry: SessionEntry): SessionEntry {
         toolName,
         isError: Boolean(message.isError),
         content: [{ type: "text", text: summary }],
+        // Preserve toolCallId — required by providers (Anthropic: tool_use_id)
+        ...(message.toolCallId != null ? { toolCallId: message.toolCallId } : {}),
+        ...(message.timestamp != null ? { timestamp: message.timestamp } : {}),
       },
     };
   }
@@ -119,6 +129,7 @@ function sanitizeMessageEntryForFork(entry: SessionEntry): SessionEntry {
     message: {
       role: "user",
       content: textBlocks.length > 0 ? textBlocks : [],
+      ...(message.timestamp != null ? { timestamp: message.timestamp } : {}),
     },
   };
 }

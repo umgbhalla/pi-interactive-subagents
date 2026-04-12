@@ -1562,7 +1562,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           `Other tracks running in parallel: ${otherTracks}.`,
           `Work independently on your track only. Do not attempt work belonging to the other tracks.`,
           `When done, write a concise summary of what you accomplished and any changes you made.`,
-        ].join("\n\n");
+        ].join(" ");
 
         const running = await launchSubagent(
           {
