@@ -6,7 +6,7 @@ import { basename, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "cmux" | "tmux" | "zellij";
+export type MuxBackend = "supaterm" | "cmux" | "zellij";
 export type SplitDirection = "left" | "right" | "up" | "down";
 
 const commandAvailability = new Map<string, boolean>();
@@ -30,42 +30,65 @@ function hasCommand(command: string): boolean {
 
 function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
-  if (pref === "cmux" || pref === "tmux" || pref === "zellij") return pref;
+  if (pref === "supaterm" || pref === "sp") return "supaterm";
+  if (pref === "cmux" || pref === "zellij") return pref;
   return null;
 }
 
+// ── Supaterm detection ──────────────────────────────────────────────────
+
+/**
+ * Resolve the `sp` CLI binary path.
+ * Prefers SUPATERM_CLI_PATH (the bundled binary injected into Supaterm panes),
+ * falls back to `sp` on PATH.
+ */
+function spBin(): string {
+  const envPath = process.env.SUPATERM_CLI_PATH?.trim();
+  if (envPath && existsSync(envPath)) return envPath;
+  return "sp";
+}
+
+function isSupatermRuntimeAvailable(): boolean {
+  return !!process.env.SUPATERM_SOCKET_PATH && (!!process.env.SUPATERM_CLI_PATH || hasCommand("sp"));
+}
+
+export function isSupatermAvailable(): boolean {
+  return isSupatermRuntimeAvailable();
+}
+
+// ── cmux detection ──────────────────────────────────────────────────────
+
 function isCmuxRuntimeAvailable(): boolean {
   return !!process.env.CMUX_SOCKET_PATH && hasCommand("cmux");
-}
-
-function isTmuxRuntimeAvailable(): boolean {
-  return !!process.env.TMUX && hasCommand("tmux");
-}
-
-function isZellijRuntimeAvailable(): boolean {
-  return !!(process.env.ZELLIJ || process.env.ZELLIJ_SESSION_NAME) && hasCommand("zellij");
 }
 
 export function isCmuxAvailable(): boolean {
   return isCmuxRuntimeAvailable();
 }
 
-export function isTmuxAvailable(): boolean {
-  return isTmuxRuntimeAvailable();
+// ── zellij detection ────────────────────────────────────────────────────
+
+function isZellijRuntimeAvailable(): boolean {
+  return !!(process.env.ZELLIJ || process.env.ZELLIJ_SESSION_NAME) && hasCommand("zellij");
 }
 
 export function isZellijAvailable(): boolean {
   return isZellijRuntimeAvailable();
 }
 
+// ── Backend resolution ──────────────────────────────────────────────────
+// Precedence: supaterm > cmux > zellij
+// Supaterm must come first because `sp run` injects TMUX env vars for compat,
+// which would cause a false-positive tmux detection if tmux were still checked.
+
 export function getMuxBackend(): MuxBackend | null {
   const pref = muxPreference();
+  if (pref === "supaterm") return isSupatermRuntimeAvailable() ? "supaterm" : null;
   if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
-  if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
   if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
 
+  if (isSupatermRuntimeAvailable()) return "supaterm";
   if (isCmuxRuntimeAvailable()) return "cmux";
-  if (isTmuxRuntimeAvailable()) return "tmux";
   if (isZellijRuntimeAvailable()) return "zellij";
   return null;
 }
@@ -76,16 +99,16 @@ export function isMuxAvailable(): boolean {
 
 export function muxSetupHint(): string {
   const pref = muxPreference();
+  if (pref === "supaterm") {
+    return "Run pi inside Supaterm.";
+  }
   if (pref === "cmux") {
     return "Start pi inside cmux (`cmux pi`).";
-  }
-  if (pref === "tmux") {
-    return "Start pi inside tmux (`tmux new -A -s pi 'pi'`).";
   }
   if (pref === "zellij") {
     return "Start pi inside zellij (`zellij --session pi`, then run `pi`).";
   }
-  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), or zellij (`zellij --session pi`, then run `pi`).";
+  return "Start pi inside Supaterm, cmux (`cmux pi`), or zellij (`zellij --session pi`, then run `pi`).";
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -95,6 +118,8 @@ function requireMuxBackend(): MuxBackend {
   }
   return backend;
 }
+
+// ── Shell helpers ───────────────────────────────────────────────────────
 
 /**
  * Detect if the user's default shell is fish.
@@ -121,6 +146,8 @@ function tailLines(text: string, lines: number): string {
   if (split.length <= lines) return text;
   return split.slice(-lines).join("\n");
 }
+
+// ── Zellij helpers ──────────────────────────────────────────────────────
 
 function zellijPaneId(surface: string): string {
   return surface.startsWith("pane:") ? surface.slice("pane:".length) : surface;
@@ -161,14 +188,98 @@ async function zellijActionAsync(args: string[], surface?: string): Promise<stri
   return stdout;
 }
 
+// ── Supaterm helpers ────────────────────────────────────────────────────
+
+/**
+ * Result from `sp tab new --output json` or `sp pane split --output json`.
+ * Contains 1-based indices used to construct pane selectors (space/tab/pane).
+ */
+interface SpCreateResult {
+  windowIndex: number;
+  spaceIndex: number;
+  tabIndex: number;
+  paneIndex: number;
+  [key: string]: unknown;
+}
+
+/** Build a pane selector string: "space/tab/pane" (1-based). */
+function spPaneSelector(result: SpCreateResult): string {
+  return `${result.spaceIndex}/${result.tabIndex}/${result.paneIndex}`;
+}
+
+/** Build a tab selector string: "space/tab" (1-based). */
+function spTabSelector(result: SpCreateResult): string {
+  return `${result.spaceIndex}/${result.tabIndex}`;
+}
+
+// ── CLI context for prompt injection ────────────────────────────────────
+
+/**
+ * Return a backend-specific CLI reference block for prompt injection.
+ * This tells the agent which terminal management commands are available.
+ */
+export function muxCliPromptSnippet(): string | null {
+  const backend = getMuxBackend();
+
+  if (backend === "supaterm") {
+    return [
+      "You are running inside Supaterm. The `sp` CLI manages terminal tabs, panes, and spaces.",
+      "Key sp commands:",
+      "  sp tab new [--focus] [CMD...]          — create a new tab",
+      "  sp pane split <dir> [--in TARGET]      — split pane (dir: down/right/left/up)",
+      "  sp pane send TARGET TEXT               — send text to a pane (pipe via stdin with -)",
+      "  sp pane capture TARGET [--lines N]     — read pane output (--scope scrollback|visible)",
+      "  sp pane close TARGET                   — close a pane",
+      "  sp tab rename TITLE [TARGET]           — rename a tab",
+      "  sp space rename NAME                   — rename the current space/workspace",
+      "  sp pane notify [--title T] [--body B]  — desktop notification",
+      "  sp tree                                — show full terminal topology",
+      "Target selectors are 1-based: space/tab/pane (e.g. 1/2/1).",
+      "Output modes: --output json | --output plain | (default: human).",
+    ].join("\n");
+  }
+
+  if (backend === "cmux") {
+    return [
+      "You are running inside cmux. The `cmux` CLI manages terminal surfaces.",
+      "Key cmux commands:",
+      "  cmux new-surface --type terminal       — create a new tab",
+      "  cmux new-split <dir> [--surface ID]    — split pane (dir: down/right/left/up)",
+      "  cmux send --surface ID TEXT            — send text to a surface",
+      "  cmux read-screen --surface ID --lines N — read surface output",
+      "  cmux close-surface --surface ID        — close a surface",
+      "  cmux rename-tab --surface ID NAME      — rename a tab",
+      "  cmux focus-panel --panel ID            — focus a surface",
+      "Surface identifiers: surface:N (e.g. surface:42).",
+    ].join("\n");
+  }
+
+  return null;
+}
+
+// ── Surface operations ──────────────────────────────────────────────────
+
 /**
  * Create a new terminal surface for a subagent.
- * Uses a background tab in cmux, and a split pane in tmux/zellij.
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij).
+ * Uses a background tab in supaterm/cmux, and a split pane in zellij.
+ * Returns an identifier (e.g. "1/2/1" in supaterm, "surface:42" in cmux, "pane:7" in zellij).
  */
 export function createSurface(name: string, options?: { focus?: boolean }): string {
   const shouldFocus = options?.focus === true;
   const backend = requireMuxBackend();
+
+  if (backend === "supaterm") {
+    const args = ["tab", "new", "--output", "json"];
+    if (shouldFocus) args.push("--focus");
+    const result: SpCreateResult = JSON.parse(
+      execFileSync(spBin(), args, { encoding: "utf8" }).trim()
+    );
+    const surface = spPaneSelector(result);
+    try {
+      execFileSync(spBin(), ["tab", "rename", name, spTabSelector(result)], { encoding: "utf8" });
+    } catch { /* optional */ }
+    return surface;
+  }
 
   if (backend === "cmux") {
     const out = execSync("cmux new-surface --type terminal", {
@@ -195,7 +306,7 @@ export function createSurface(name: string, options?: { focus?: boolean }): stri
 
 /**
  * Create a new split in the given direction from an optional source pane.
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij).
+ * Returns an identifier (e.g. "1/2/1" in supaterm, "surface:42" in cmux, "pane:7" in zellij).
  */
 export function createSurfaceSplit(
   name: string,
@@ -205,6 +316,21 @@ export function createSurfaceSplit(
 ): string {
   const shouldFocus = options?.focus === true;
   const backend = requireMuxBackend();
+
+  if (backend === "supaterm") {
+    const args = ["pane", "split", direction];
+    if (!shouldFocus) args.push("--no-focus");
+    if (fromSurface) args.push("--in", fromSurface);
+    args.push("--output", "json");
+    const result: SpCreateResult = JSON.parse(
+      execFileSync(spBin(), args, { encoding: "utf8" }).trim()
+    );
+    const surface = spPaneSelector(result);
+    try {
+      execFileSync(spBin(), ["tab", "rename", name, spTabSelector(result)], { encoding: "utf8" });
+    } catch { /* optional */ }
+    return surface;
+  }
 
   if (backend === "cmux") {
     const surfaceArg = fromSurface ? ` --surface ${shellEscape(fromSurface)}` : "";
@@ -225,40 +351,6 @@ export function createSurfaceSplit(
       });
     }
     return surface;
-  }
-
-  if (backend === "tmux") {
-    const args = ["split-window"];
-    if (!shouldFocus) {
-      args.push("-d");
-    }
-    if (direction === "left" || direction === "right") {
-      args.push("-h");
-    } else {
-      args.push("-v");
-    }
-    if (direction === "left" || direction === "up") {
-      args.push("-b");
-    }
-    if (fromSurface) {
-      args.push("-t", fromSurface);
-    }
-    args.push("-P", "-F", "#{pane_id}");
-
-    const pane = execFileSync("tmux", args, { encoding: "utf8" }).trim();
-    if (!pane.startsWith("%")) {
-      throw new Error(`Unexpected tmux split-window output: ${pane}`);
-    }
-
-    try {
-      execFileSync("tmux", ["select-pane", "-t", pane, "-T", name], { encoding: "utf8" });
-    } catch {
-      // Optional.
-    }
-    if (shouldFocus) {
-      execFileSync("tmux", ["select-pane", "-t", pane], { encoding: "utf8" });
-    }
-    return pane;
   }
 
   // zellij
@@ -319,20 +411,16 @@ export function createSurfaceSplit(
 export function renameCurrentTab(title: string): void {
   const backend = requireMuxBackend();
 
+  if (backend === "supaterm") {
+    // Uses ambient SUPATERM_SURFACE_ID context to find the current tab.
+    execFileSync(spBin(), ["tab", "rename", title], { encoding: "utf8" });
+    return;
+  }
+
   if (backend === "cmux") {
     const surfaceId = process.env.CMUX_SURFACE_ID;
     if (!surfaceId) throw new Error("CMUX_SURFACE_ID not set");
     execSync(`cmux rename-tab --surface ${shellEscape(surfaceId)} ${shellEscape(title)}`, { encoding: "utf8" });
-    return;
-  }
-
-  if (backend === "tmux") {
-    const paneId = process.env.TMUX_PANE;
-    if (!paneId) throw new Error("TMUX_PANE not set");
-    const windowId = execFileSync("tmux", ["display-message", "-p", "-t", paneId, "#{window_id}"], {
-      encoding: "utf8",
-    }).trim();
-    execFileSync("tmux", ["rename-window", "-t", windowId, title], { encoding: "utf8" });
     return;
   }
 
@@ -345,22 +433,17 @@ export function renameCurrentTab(title: string): void {
 export function renameWorkspace(title: string): void {
   const backend = requireMuxBackend();
 
-  if (backend === "cmux") {
-    execSync(`cmux workspace-action --action rename --title ${shellEscape(title)}`, { encoding: "utf8" });
+  if (backend === "supaterm") {
+    try {
+      execFileSync(spBin(), ["space", "rename", title], { encoding: "utf8" });
+    } catch {
+      // Optional — may fail with a single space.
+    }
     return;
   }
 
-  if (backend === "tmux") {
-    if (process.env.PI_SUBAGENT_RENAME_TMUX_SESSION !== "1") {
-      return;
-    }
-
-    const paneId = process.env.TMUX_PANE;
-    if (!paneId) throw new Error("TMUX_PANE not set");
-    const sessionId = execFileSync("tmux", ["display-message", "-p", "-t", paneId, "#{session_id}"], {
-      encoding: "utf8",
-    }).trim();
-    execFileSync("tmux", ["rename-session", "-t", sessionId, title], { encoding: "utf8" });
+  if (backend === "cmux") {
+    execSync(`cmux workspace-action --action rename --title ${shellEscape(title)}`, { encoding: "utf8" });
     return;
   }
 
@@ -373,16 +456,19 @@ export function renameWorkspace(title: string): void {
 export function sendCommand(surface: string, command: string): void {
   const backend = requireMuxBackend();
 
-  if (backend === "cmux") {
-    execSync(`cmux send --surface ${shellEscape(surface)} ${shellEscape(command + "\n")}`, {
+  if (backend === "supaterm") {
+    // Pipe command text via stdin (`-`) and use `--newline` to append Enter.
+    execFileSync(spBin(), ["pane", "send", "--newline", surface, "-"], {
       encoding: "utf8",
+      input: command,
     });
     return;
   }
 
-  if (backend === "tmux") {
-    execFileSync("tmux", ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
-    execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
+  if (backend === "cmux") {
+    execSync(`cmux send --surface ${shellEscape(surface)} ${shellEscape(command + "\n")}`, {
+      encoding: "utf8",
+    });
     return;
   }
 
@@ -396,17 +482,19 @@ export function sendCommand(surface: string, command: string): void {
 export function readScreen(surface: string, lines = 50): string {
   const backend = requireMuxBackend();
 
+  if (backend === "supaterm") {
+    return execFileSync(spBin(), [
+      "pane", "capture", surface,
+      "--lines", String(lines),
+      "--scope", "scrollback",
+    ], { encoding: "utf8" });
+  }
+
   if (backend === "cmux") {
     return execSync(
       `cmux read-screen --surface ${shellEscape(surface)} --lines ${lines}`,
       { encoding: "utf8" }
     );
-  }
-
-  if (backend === "tmux") {
-    return execFileSync("tmux", ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`], {
-      encoding: "utf8",
-    });
   }
 
   const tmpPath = join(
@@ -428,19 +516,19 @@ export function readScreen(surface: string, lines = 50): string {
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
   const backend = requireMuxBackend();
 
+  if (backend === "supaterm") {
+    const { stdout } = await execFileAsync(spBin(), [
+      "pane", "capture", surface,
+      "--lines", String(lines),
+      "--scope", "scrollback",
+    ], { encoding: "utf8" });
+    return stdout;
+  }
+
   if (backend === "cmux") {
     const { stdout } = await execFileAsync(
       "cmux",
       ["read-screen", "--surface", surface, "--lines", String(lines)],
-      { encoding: "utf8" }
-    );
-    return stdout;
-  }
-
-  if (backend === "tmux") {
-    const { stdout } = await execFileAsync(
-      "tmux",
-      ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
       { encoding: "utf8" }
     );
     return stdout;
@@ -465,15 +553,15 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 export function closeSurface(surface: string): void {
   const backend = requireMuxBackend();
 
+  if (backend === "supaterm") {
+    execFileSync(spBin(), ["pane", "close", surface], { encoding: "utf8" });
+    return;
+  }
+
   if (backend === "cmux") {
     execSync(`cmux close-surface --surface ${shellEscape(surface)}`, {
       encoding: "utf8",
     });
-    return;
-  }
-
-  if (backend === "tmux") {
-    execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
     return;
   }
 

@@ -8,6 +8,7 @@ import { homedir, tmpdir } from "node:os";
 import {
   isMuxAvailable,
   muxSetupHint,
+  muxCliPromptSnippet,
   createSurface,
   sendCommand,
   pollForExit,
@@ -54,6 +55,24 @@ const AgentGroupParams = Type.Object({
   // wait param removed — agent_group is always async
 });
 
+const SelfForkTrack = Type.Object({
+  name: Type.String({ description: "Short label for this track (e.g. 'optimize queries', 'refactor auth')" }),
+  prompt: Type.String({ description: "What to work on in this track. The fork gets full conversation context plus this prompt." }),
+});
+
+const SelfForkParams = Type.Object({
+  tracks: Type.Array(SelfForkTrack, {
+    minItems: 2,
+    maxItems: 8,
+    description: "Parallel tracks to fork into. Each track gets a full copy of the current conversation and runs independently.",
+  }),
+  model: Type.Optional(Type.String({ description: "Model override for all forks. Default: same as current session." })),
+  modelHint: Type.Optional(Type.Union([
+    Type.Literal("frontend"),
+    Type.Literal("non-frontend"),
+  ], { description: "Hint the model family for all forks. Ignored when model is set." })),
+});
+
 const ActiveSubagentsParams = Type.Object({
   screenLines: Type.Optional(Type.Number({ description: "Include the last N lines of terminal output for each running subagent. Default: 0.", minimum: 0, maximum: 200 })),
 });
@@ -78,7 +97,7 @@ interface AgentDefaults {
 }
 
 /** Tools that are gated by `spawning: false` */
-const SPAWNING_TOOLS = new Set(["subagent", "agent_group", "subagents_list", "subagent_resume", "active_subagents", "message_subagent"]);
+const SPAWNING_TOOLS = new Set(["subagent", "agent_group", "selffork", "subagents_list", "subagent_resume", "active_subagents", "message_subagent"]);
 
 /**
  * Resolve the effective set of denied tool names from agent defaults.
@@ -766,12 +785,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
       "Returns immediately — the agent runs in the background and steers results back when done. " +
       "After launch, inform the user and wait; do not poll unless explicitly asked. " +
-      "Supports cmux, tmux, and zellij.",
+      "Supports Supaterm (sp), cmux, and zellij.",
     promptSnippet:
       "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
       "Returns immediately — the agent runs in the background and steers results back when done. " +
       "After launch, inform the user and wait; do not poll unless explicitly asked. " +
-      "Supports cmux, tmux, and zellij.",
+      "Supports Supaterm (sp), cmux, and zellij." +
+      (muxCliPromptSnippet() ? "\n\n" + muxCliPromptSnippet() : ""),
     parameters: SubagentParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
