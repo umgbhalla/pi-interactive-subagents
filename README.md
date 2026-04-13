@@ -517,6 +517,8 @@ The sanitizer (`session.ts:writeSanitizedForkSession`) ensures:
 - Regular tool output is truncated to 16 lines / 1200 chars to keep context compact
 - Thinking blocks and signatures are stripped
 - Session metadata fields (`usage`, `model`, `timestamp`) are preserved for replay
+- Forked runs append the follow-up task directly into the sanitized child session as a normal user turn
+- Non-forked runs launch the follow-up task via `@file` to avoid shell quoting and argv-length issues
 
 ---
 

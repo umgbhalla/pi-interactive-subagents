@@ -226,6 +226,27 @@ export function appendBranchSummary(
 }
 
 /**
+ * Append a plain user text message to an existing session file.
+ * Returns the new entry's id.
+ */
+export function appendUserTextMessage(sessionFile: string, text: string): string {
+  const parentId = getLeafId(sessionFile);
+  const id = randomBytes(4).toString("hex");
+  const entry = {
+    type: "message",
+    id,
+    parentId,
+    message: {
+      role: "user",
+      content: [{ type: "text", text }],
+      timestamp: Date.now(),
+    },
+  };
+  appendFileSync(sessionFile, JSON.stringify(entry) + "\n", "utf8");
+  return id;
+}
+
+/**
  * Copy the session file to destDir for parallel worker isolation.
  * Returns the path of the copy.
  */

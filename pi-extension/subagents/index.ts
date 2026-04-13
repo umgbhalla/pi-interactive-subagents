@@ -23,8 +23,10 @@ import {
   getNewEntries,
   findLastAssistantMessage,
   writeSanitizedForkSession,
+  appendUserTextMessage,
 } from "./session.ts";
 import { resolveHintedModel, type ModelHint } from "./model-hints.ts";
+import { writeSubagentTaskArtifact } from "./task-artifact.ts";
 
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
@@ -502,20 +504,15 @@ async function launchSubagent(
   const envPrefix = envParts.join(" ") + " ";
 
   // Pass task to the sub-agent.
-  // For fork mode, pass as a plain quoted argument — the forked session already
-  // has the full conversation context, so the message arrives as if the user typed it.
-  // For non-fork mode, write to an artifact file and pass via @file to handle
-  // long task descriptions with role/instructions safely.
+  // Forked runs should see the task as a normal user turn, not a <file> block,
+  // so append it directly into the forked session history before launch.
+  // Non-forked runs still use @file to avoid shell quoting/argv-length issues.
   if (params.fork) {
-    parts.push(shellEscape(fullTask));
+    appendUserTextMessage(subagentSessionFile, fullTask);
   } else {
     const sessionId = ctx.sessionManager.getSessionId();
     const artifactDir = getArtifactDir(ctx.cwd, sessionId);
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const artifactName = `context/${params.name.toLowerCase().replace(/[^a-zA-Z0-9._-]/g, "-")}-${timestamp}.md`;
-    const artifactPath = join(artifactDir, artifactName);
-    mkdirSync(dirname(artifactPath), { recursive: true });
-    writeFileSync(artifactPath, fullTask, "utf8");
+    const artifactPath = writeSubagentTaskArtifact(artifactDir, params.name, fullTask);
     parts.push(`@${shellEscape(artifactPath)}`);
   }
 

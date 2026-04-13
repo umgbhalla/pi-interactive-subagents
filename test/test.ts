@@ -10,6 +10,7 @@ import {
   getNewEntries,
   findLastAssistantMessage,
   appendBranchSummary,
+  appendUserTextMessage,
   copySessionFile,
   mergeNewEntries,
   writeSanitizedForkSession,
@@ -21,6 +22,10 @@ import {
   normalizeModelHint,
   resolveHintedModel,
 } from "../pi-extension/subagents/model-hints.ts";
+import {
+  buildSubagentTaskArtifactPath,
+  writeSubagentTaskArtifact,
+} from "../pi-extension/subagents/task-artifact.ts";
 
 // --- Helpers ---
 
@@ -227,6 +232,19 @@ describe("session.ts", () => {
     });
   });
 
+  describe("appendUserTextMessage", () => {
+    it("appends a plain user text turn to the current leaf", () => {
+      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      const id = appendUserTextMessage(file, "fork task here");
+      const entries = readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      const appended = entries.at(-1);
+      assert.equal(appended.id, id);
+      assert.equal(appended.parentId, "asst-001");
+      assert.equal(appended.message.role, "user");
+      assert.deepEqual(appended.message.content, [{ type: "text", text: "fork task here" }]);
+    });
+  });
+
   describe("copySessionFile", () => {
     it("creates a copy with different path", () => {
       const file = createSessionFile(dir, [SESSION_HEADER, USER_MSG]);
@@ -278,7 +296,12 @@ describe("session.ts", () => {
       assert.equal(entries.at(-1)?.id, "asst-002");
 
       const assistantTool = entries[2];
-      assert.deepEqual(assistantTool.message.content, [{ type: "text", text: "[Assistant called tool: active_subagents]" }]);
+      assert.deepEqual(assistantTool.message.content, [{
+        type: "toolCall",
+        id: "toolu_1",
+        name: "active_subagents",
+        arguments: {},
+      }]);
 
       const noisyTool = entries[3];
       assert.equal(noisyTool.message.toolName, "active_subagents");
@@ -317,8 +340,8 @@ describe("session.ts", () => {
       const tool = entries[2];
       assert.equal(tool.message.toolName, "bash");
       assert.equal(tool.message.details, undefined);
-      assert.equal(tool.message.toolCallId, undefined);
-      assert.equal(tool.message.timestamp, undefined);
+      assert.equal(tool.message.toolCallId, "tc-long");
+      assert.equal(tool.message.timestamp, 123);
       assert.match(tool.message.content[0].text, /^line 0/);
       assert.ok(!tool.message.content[0].text.includes("line 39"));
     });
@@ -404,6 +427,29 @@ describe("model-hints.ts", () => {
         modelHint: "non-frontend",
       });
     });
+  });
+});
+
+describe("task-artifact.ts", () => {
+  let dir: string;
+
+  before(() => {
+    dir = createTestDir();
+  });
+
+  after(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("builds sanitized markdown artifact paths", () => {
+    const path = buildSubagentTaskArtifactPath(dir, "Fork: provider-inventory", new Date("2026-04-13T07:34:28.680Z"));
+    assert.equal(path, join(dir, "context/fork-provider-inventory-2026-04-13T07-34-28.md"));
+  });
+
+  it("writes task content to a file-backed prompt artifact", () => {
+    const path = writeSubagentTaskArtifact(dir, "Fork: provider-inventory", "very long prompt", new Date("2026-04-13T07:34:28.680Z"));
+    assert.equal(readFileSync(path, "utf8"), "very long prompt");
+    assert.equal(path, join(dir, "context/fork-provider-inventory-2026-04-13T07-34-28.md"));
   });
 });
 
