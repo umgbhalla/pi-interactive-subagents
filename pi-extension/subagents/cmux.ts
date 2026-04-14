@@ -1,12 +1,38 @@
-import { execSync, execFile, execFileSync } from "node:child_process";
+import { execSync, execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "supaterm" | "cmux" | "zellij";
+export type MuxBackend = "supaterm" | "cmux" | "zellij" | "screen" | "compat";
+
+// ── Screen (GNU Screen) backend ─────────────────────────────────────────
+// Used when no visual multiplexer is available but `screen` is installed.
+// Provides a real PTY so pi's TUI works correctly.
+
+interface ScreenEntry {
+  sessionName: string;
+  started: boolean; // true after first sendCommand
+}
+
+const screenStore = new Map<string, ScreenEntry>();
+let screenIdCounter = 0;
+
+// ── Compat (child_process) backend ──────────────────────────────────────
+// Last-resort fallback when neither a visual multiplexer nor screen is available.
+// Subagents run as headless child processes with piped IO.
+// WARNING: pi requires a TTY — compat mode will hang for pi processes.
+// It works for simple non-interactive commands (tests, echo, etc).
+
+interface CompatEntry {
+  child: ChildProcess | null;
+  outputBuffer: string;
+}
+
+const compatStore = new Map<string, CompatEntry>();
+let compatIdCounter = 0;
 export type SplitDirection = "left" | "right" | "up" | "down";
 
 const commandAvailability = new Map<string, boolean>();
@@ -32,7 +58,19 @@ function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
   if (pref === "supaterm" || pref === "sp") return "supaterm";
   if (pref === "cmux" || pref === "zellij") return pref;
+  if (pref === "screen") return "screen";
+  if (pref === "compat") return "compat";
   return null;
+}
+
+// ── Screen detection ─────────────────────────────────────────────────────
+
+function isScreenRuntimeAvailable(): boolean {
+  return hasCommand("screen");
+}
+
+export function isScreenAvailable(): boolean {
+  return isScreenRuntimeAvailable();
 }
 
 // ── Supaterm detection ──────────────────────────────────────────────────
@@ -81,20 +119,36 @@ export function isZellijAvailable(): boolean {
 // Supaterm must come first because `sp run` injects TMUX env vars for compat,
 // which would cause a false-positive tmux detection if tmux were still checked.
 
-export function getMuxBackend(): MuxBackend | null {
+// Precedence: supaterm > cmux > zellij > screen > compat (always available)
+export function getMuxBackend(): MuxBackend {
   const pref = muxPreference();
-  if (pref === "supaterm") return isSupatermRuntimeAvailable() ? "supaterm" : null;
-  if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
-  if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
+  if (pref === "compat") return "compat";
+  if (pref === "screen") return isScreenRuntimeAvailable() ? "screen" : "compat";
+  if (pref === "supaterm") return isSupatermRuntimeAvailable() ? "supaterm" : "compat";
+  if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : "compat";
+  if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : "compat";
 
   if (isSupatermRuntimeAvailable()) return "supaterm";
   if (isCmuxRuntimeAvailable()) return "cmux";
   if (isZellijRuntimeAvailable()) return "zellij";
-  return null;
+  if (isScreenRuntimeAvailable()) return "screen";
+  return "compat";
 }
 
+/** Always true — screen or compat backend is always available. */
 export function isMuxAvailable(): boolean {
-  return getMuxBackend() !== null;
+  return true;
+}
+
+/** True when using raw child_process fallback (no PTY — interactive pi will hang). */
+export function isCompatMode(): boolean {
+  return getMuxBackend() === "compat";
+}
+
+/** True when no visual pane management is available (screen or raw compat). */
+export function isNonVisualMode(): boolean {
+  const b = getMuxBackend();
+  return b === "screen" || b === "compat";
 }
 
 export function muxSetupHint(): string {
@@ -108,15 +162,18 @@ export function muxSetupHint(): string {
   if (pref === "zellij") {
     return "Start pi inside zellij (`zellij --session pi`, then run `pi`).";
   }
+  const backend = getMuxBackend();
+  if (backend === "screen") {
+    return "Running with GNU Screen backend (no visual panes). For the full experience, start pi inside Supaterm, cmux, or zellij.";
+  }
+  if (backend === "compat") {
+    return "Running in raw compatibility mode (no PTY, no visual panes). Install GNU Screen, or start pi inside Supaterm, cmux, or zellij.";
+  }
   return "Start pi inside Supaterm, cmux (`cmux pi`), or zellij (`zellij --session pi`, then run `pi`).";
 }
 
 function requireMuxBackend(): MuxBackend {
-  const backend = getMuxBackend();
-  if (!backend) {
-    throw new Error(`No supported terminal multiplexer found. ${muxSetupHint()}`);
-  }
-  return backend;
+  return getMuxBackend();
 }
 
 // ── Shell helpers ───────────────────────────────────────────────────────
@@ -226,6 +283,34 @@ function spTabSelector(result: SpCreateResult): string {
   return `${result.spaceIndex}/${result.tabIndex}`;
 }
 
+// ── Screen helpers ──────────────────────────────────────────────────────
+
+/**
+ * Capture the screen contents of a GNU Screen session.
+ * Uses `hardcopy -h` (full scrollback) with `-p 0` (target window 0).
+ */
+function screenHardcopy(surface: string, lines: number): string {
+  const entry = screenStore.get(surface);
+  if (!entry) return "";
+  const tmpFile = join(
+    tmpdir(),
+    `pi-screen-cap-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
+  );
+  try {
+    execSync(
+      `screen -S ${shellEscape(entry.sessionName)} -p 0 -X hardcopy -h ${shellEscape(tmpFile)}`,
+      { encoding: "utf8" },
+    );
+    if (!existsSync(tmpFile)) return "";
+    const content = readFileSync(tmpFile, "utf8");
+    return tailLines(content.trimEnd(), lines);
+  } catch {
+    return ""; // Session may have already exited
+  } finally {
+    try { rmSync(tmpFile, { force: true }); } catch {}
+  }
+}
+
 // ── CLI context for prompt injection ────────────────────────────────────
 
 /**
@@ -282,6 +367,19 @@ export function createSurface(name: string, options?: { focus?: boolean }): stri
   const shouldFocus = options?.focus === true;
   const backend = requireMuxBackend();
 
+  if (backend === "screen") {
+    const sessionName = `pi-sa-${++screenIdCounter}-${Date.now()}`;
+    const id = `screen:${sessionName}`;
+    screenStore.set(id, { sessionName, started: false });
+    return id;
+  }
+
+  if (backend === "compat") {
+    const id = `compat:${++compatIdCounter}`;
+    compatStore.set(id, { child: null, outputBuffer: "" });
+    return id;
+  }
+
   if (backend === "supaterm") {
     const args = ["tab", "new", "--json"];
     if (shouldFocus) args.push("--focus");
@@ -321,6 +419,7 @@ export function createSurface(name: string, options?: { focus?: boolean }): stri
 /**
  * Create a new split in the given direction from an optional source pane.
  * Returns an identifier (e.g. "1/2/1" in supaterm, "surface:42" in cmux, "pane:7" in zellij).
+ * In compat mode, splits are not supported — creates a new compat process instead.
  */
 export function createSurfaceSplit(
   name: string,
@@ -330,6 +429,10 @@ export function createSurfaceSplit(
 ): string {
   const shouldFocus = options?.focus === true;
   const backend = requireMuxBackend();
+
+  if (backend === "screen" || backend === "compat") {
+    return createSurface(name, options);
+  }
 
   if (backend === "supaterm") {
     const args = ["pane", "split", direction];
@@ -425,6 +528,12 @@ export function createSurfaceSplit(
 export function renameCurrentTab(title: string): void {
   const backend = requireMuxBackend();
 
+  if (backend === "screen" || backend === "compat") {
+    // Best-effort: terminal escape sequence (works in most emulators)
+    try { process.stdout.write(`\x1b]0;${title}\x07`); } catch {}
+    return;
+  }
+
   if (backend === "supaterm") {
     // Uses ambient SUPATERM_SURFACE_ID context to find the current tab.
     execFileSync(spBin(), ["tab", "rename", title], { encoding: "utf8" });
@@ -446,6 +555,12 @@ export function renameCurrentTab(title: string): void {
  */
 export function renameWorkspace(title: string): void {
   const backend = requireMuxBackend();
+
+  if (backend === "screen" || backend === "compat") {
+    // Best-effort: same escape sequence as renameCurrentTab
+    try { process.stdout.write(`\x1b]0;${title}\x07`); } catch {}
+    return;
+  }
 
   if (backend === "supaterm") {
     try {
@@ -469,6 +584,77 @@ export function renameWorkspace(title: string): void {
  */
 export function sendCommand(surface: string, command: string): void {
   const backend = requireMuxBackend();
+
+  if (backend === "screen") {
+    const entry = screenStore.get(surface);
+    if (!entry) throw new Error(`Unknown screen surface: ${surface}`);
+
+    if (!entry.started) {
+      // First command — create a detached screen session running the command.
+      // This gives the child process a real PTY so pi's TUI works.
+      // After the command finishes, `exec cat` keeps the session alive so
+      // pollForExit can read the sentinel via hardcopy. closeSurface sends
+      // `screen -X quit` to tear it down.
+      const wrappedCommand = `${command}; exec cat`;
+      execSync(
+        `screen -dmS ${shellEscape(entry.sessionName)} bash -c ${shellEscape(wrappedCommand)}`,
+        { encoding: "utf8", env: { ...process.env } },
+      );
+      entry.started = true;
+    } else {
+      // Subsequent command (message_subagent) — use readbuf+paste for
+      // arbitrary-length text (screen's `stuff` has a ~256 char limit).
+      const tmpFile = join(
+        tmpdir(),
+        `pi-screen-msg-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
+      );
+      try {
+        writeFileSync(tmpFile, command, "utf8");
+        execSync(`screen -S ${shellEscape(entry.sessionName)} -p 0 -X readbuf ${shellEscape(tmpFile)}`, { encoding: "utf8" });
+        execSync(`screen -S ${shellEscape(entry.sessionName)} -p 0 -X paste .`, { encoding: "utf8" });
+        // Send Enter to execute
+        execSync(`screen -S ${shellEscape(entry.sessionName)} -p 0 -X stuff "\\015"`, { encoding: "utf8" });
+      } finally {
+        try { rmSync(tmpFile, { force: true }); } catch {}
+      }
+    }
+    return;
+  }
+
+  if (backend === "compat") {
+    const entry = compatStore.get(surface);
+    if (!entry) throw new Error(`Unknown compat surface: ${surface}`);
+
+    if (!entry.child) {
+      // First command — spawn a shell process
+      const child = spawn("bash", ["-c", command], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env },
+        cwd: process.cwd(),
+      });
+      entry.child = child;
+
+      child.stdout?.on("data", (data: Buffer) => {
+        entry.outputBuffer += data.toString();
+      });
+      child.stderr?.on("data", (data: Buffer) => {
+        entry.outputBuffer += data.toString();
+      });
+      child.on("error", () => {
+        // Process spawn error — sentinel won't appear, pollForExit will hang
+        // until aborted. Inject a failure sentinel so it gets picked up.
+        entry.outputBuffer += "\n__SUBAGENT_DONE_1__\n";
+      });
+    } else {
+      // Subsequent command — write to stdin (e.g. message_subagent)
+      try {
+        entry.child.stdin?.write(command + "\n");
+      } catch {
+        // stdin may be closed if the process already exited
+      }
+    }
+    return;
+  }
 
   if (backend === "supaterm") {
     // Pipe command text via stdin (`-`) and use `--newline` to append Enter.
@@ -495,6 +681,16 @@ export function sendCommand(surface: string, command: string): void {
  */
 export function readScreen(surface: string, lines = 50): string {
   const backend = requireMuxBackend();
+
+  if (backend === "screen") {
+    return screenHardcopy(surface, lines);
+  }
+
+  if (backend === "compat") {
+    const entry = compatStore.get(surface);
+    if (!entry) return "";
+    return tailLines(entry.outputBuffer, lines);
+  }
 
   if (backend === "supaterm") {
     return execFileSync(spBin(), [
@@ -529,6 +725,16 @@ export function readScreen(surface: string, lines = 50): string {
  */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
   const backend = requireMuxBackend();
+
+  if (backend === "screen") {
+    return screenHardcopy(surface, lines);
+  }
+
+  if (backend === "compat") {
+    const entry = compatStore.get(surface);
+    if (!entry) return "";
+    return tailLines(entry.outputBuffer, lines);
+  }
 
   if (backend === "supaterm") {
     const { stdout } = await execFileAsync(spBin(), [
@@ -566,6 +772,26 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  */
 export function closeSurface(surface: string): void {
   const backend = requireMuxBackend();
+
+  if (backend === "screen") {
+    const entry = screenStore.get(surface);
+    if (entry) {
+      try {
+        execSync(`screen -S ${shellEscape(entry.sessionName)} -p 0 -X quit`, { encoding: "utf8" });
+      } catch {} // Session may already be dead
+      screenStore.delete(surface);
+    }
+    return;
+  }
+
+  if (backend === "compat") {
+    const entry = compatStore.get(surface);
+    if (entry?.child) {
+      try { entry.child.kill("SIGTERM"); } catch {}
+    }
+    compatStore.delete(surface);
+    return;
+  }
 
   if (backend === "supaterm") {
     execFileSync(spBin(), ["pane", "close", surface], { encoding: "utf8" });

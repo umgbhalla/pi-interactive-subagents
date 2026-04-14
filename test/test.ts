@@ -16,7 +16,17 @@ import {
   writeSanitizedForkSession,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape, isCmuxAvailable } from "../pi-extension/subagents/cmux.ts";
+import {
+  shellEscape,
+  isCmuxAvailable,
+  isCompatMode,
+  isNonVisualMode,
+  getMuxBackend,
+  createSurface,
+  sendCommand,
+  readScreen,
+  closeSurface,
+} from "../pi-extension/subagents/cmux.ts";
 import {
   modelMatchesHintFamily,
   normalizeModelHint,
@@ -482,6 +492,96 @@ describe("cmux.ts", () => {
       // Can't easily mock env in node:test, just verify it returns a boolean
       const result = isCmuxAvailable();
       assert.equal(typeof result, "boolean");
+    });
+  });
+
+  describe("compat backend", () => {
+    it("getMuxBackend never returns null", () => {
+      const backend = getMuxBackend();
+      assert.ok(backend !== null, "getMuxBackend() should never return null");
+      assert.ok(
+        ["supaterm", "cmux", "zellij", "screen", "compat"].includes(backend),
+        `Unknown backend: ${backend}`
+      );
+    });
+
+    it("isCompatMode and isNonVisualMode return booleans", () => {
+      assert.equal(typeof isCompatMode(), "boolean");
+      assert.equal(typeof isNonVisualMode(), "boolean");
+    });
+
+    it("createSurface returns compat id when in raw compat mode", () => {
+      if (!isCompatMode()) return; // skip when screen or a real mux is available
+      const surface = createSurface("test-compat");
+      assert.ok(surface.startsWith("compat:"), `Expected compat:N, got ${surface}`);
+    });
+
+    it("compat lifecycle: create → sendCommand → readScreen → close", async () => {
+      if (!isCompatMode()) return;
+      const surface = createSurface("echo-test");
+      assert.ok(surface.startsWith("compat:"));
+
+      sendCommand(surface, 'echo "HELLO_FROM_COMPAT"');
+      await new Promise<void>((r) => setTimeout(r, 500));
+
+      const output = readScreen(surface, 10);
+      assert.ok(
+        output.includes("HELLO_FROM_COMPAT"),
+        `Expected output to contain HELLO_FROM_COMPAT, got: ${output}`
+      );
+
+      closeSurface(surface);
+    });
+
+    it("compat sentinel detection works", async () => {
+      if (!isCompatMode()) return;
+      const surface = createSurface("sentinel-test");
+
+      sendCommand(surface, 'echo "working..."; echo "__SUBAGENT_DONE_0__"');
+      await new Promise<void>((r) => setTimeout(r, 500));
+
+      const output = readScreen(surface, 10);
+      assert.ok(
+        output.includes("__SUBAGENT_DONE_0__"),
+        `Expected sentinel in output, got: ${output}`
+      );
+
+      closeSurface(surface);
+    });
+  });
+
+  describe("screen backend", () => {
+    it("createSurface returns screen id when screen is the backend", () => {
+      const backend = getMuxBackend();
+      if (backend !== "screen") return;
+      const surface = createSurface("test-screen");
+      assert.ok(surface.startsWith("screen:"), `Expected screen:..., got ${surface}`);
+      closeSurface(surface); // clean up
+    });
+
+    it("screen lifecycle: create → sendCommand → readScreen → close", async () => {
+      const backend = getMuxBackend();
+      if (backend !== "screen") return;
+
+      const surface = createSurface("screen-echo-test");
+      assert.ok(surface.startsWith("screen:"));
+
+      sendCommand(surface, 'echo "HELLO_FROM_SCREEN"; echo "__SUBAGENT_DONE_0__"');
+
+      // Screen needs time to start the session and run the command
+      await new Promise<void>((r) => setTimeout(r, 2000));
+
+      const output = readScreen(surface, 20);
+      assert.ok(
+        output.includes("HELLO_FROM_SCREEN"),
+        `Expected output to contain HELLO_FROM_SCREEN, got: ${output}`
+      );
+      assert.ok(
+        output.includes("__SUBAGENT_DONE_0__"),
+        `Expected sentinel in output, got: ${output}`
+      );
+
+      closeSurface(surface);
     });
   });
 

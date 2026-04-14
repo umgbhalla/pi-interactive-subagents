@@ -6,7 +6,8 @@ import { basename, dirname, join } from "node:path";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import {
-  isMuxAvailable,
+  isCompatMode,
+  isNonVisualMode,
   muxSetupHint,
   muxCliPromptSnippet,
   createSurface,
@@ -23,7 +24,6 @@ import {
   getNewEntries,
   findLastAssistantMessage,
   writeSanitizedForkSession,
-  appendUserTextMessage,
 } from "./session.ts";
 import { resolveHintedModel, type ModelHint } from "./model-hints.ts";
 import { writeSubagentTaskArtifact } from "./task-artifact.ts";
@@ -64,9 +64,9 @@ const SelfForkTrack = Type.Object({
 
 const SelfForkParams = Type.Object({
   tracks: Type.Array(SelfForkTrack, {
-    minItems: 2,
+    minItems: 1,
     maxItems: 8,
-    description: "Parallel tracks to fork into. Each track gets a full copy of the current conversation and runs independently.",
+    description: "Tracks to fork into. Each track gets a full copy of the current conversation and runs independently. A single track creates a blocking context-preserving fork.",
   }),
   model: Type.Optional(Type.String({ description: "Model override for all forks. Default: same as current session." })),
   modelHint: Type.Optional(Type.Union([
@@ -187,18 +187,11 @@ function formatElapsed(seconds: number): string {
   return `${m}m ${s}s`;
 }
 
-function muxUnavailableResult(kind: "subagents" | "tab-title" = "subagents") {
-  if (kind === "tab-title") {
-    return {
-      content: [{ type: "text" as const, text: `Terminal multiplexer not available. ${muxSetupHint()}` }],
-      details: { error: "mux not available" },
-    };
-  }
-
-  return {
-    content: [{ type: "text" as const, text: `Subagents require a supported terminal multiplexer. ${muxSetupHint()}` }],
-    details: { error: "mux not available" },
-  };
+/** Note appended to tool results when running without visual panes (screen or raw compat). */
+function compatModeNote(): string {
+  return isNonVisualMode()
+    ? "\n\n⚠️ " + muxSetupHint()
+    : "";
 }
 
 /**
@@ -424,10 +417,9 @@ async function launchSubagent(
     await new Promise<void>((resolve) => setTimeout(resolve, 500));
   }
 
-  // Build the task message
-  // When forking, the sub-agent already has the full conversation context.
-  // Only send the user's task as a clean message — no wrapper instructions
-  // that would confuse the agent into thinking it needs to restart.
+  // Build the task message.
+  // Forked runs still need explicit completion/tab-title instructions,
+  // but should receive them as a normal user turn in the forked context.
   const modeHint = "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
   const summaryInstruction =
     "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
@@ -439,16 +431,18 @@ async function launchSubagent(
     `Example: "[${agentType}] Analyzing auth module". Keep it concise.`;
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const roleBlock = identity ? `\n\n${identity}` : "";
-  const typedForkTask = identity
-    ? [
-        "Continue from the current conversation context. For this fork only, adopt the following role and constraints:",
-        identity,
-        tabTitleInstruction,
-        modeHint,
-        params.task,
-        summaryInstruction,
-      ].filter(Boolean).join("\n\n")
-    : params.task;
+
+  const typedForkTask = [
+    identity
+      ? "Continue from the current conversation context. For this fork only, adopt the following role and constraints:"
+      : "Continue from the current conversation context.",
+    identity,
+    tabTitleInstruction,
+    modeHint,
+    params.task,
+    summaryInstruction,
+  ].filter(Boolean).join("\n\n");
+
   const fullTask = params.fork
     ? typedForkTask
     : `${roleBlock}\n\n${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}\n\n${summaryInstruction}`;
@@ -504,11 +498,11 @@ async function launchSubagent(
   const envPrefix = envParts.join(" ") + " ";
 
   // Pass task to the sub-agent.
-  // Forked runs should see the task as a normal user turn, not a <file> block,
-  // so append it directly into the forked session history before launch.
-  // Non-forked runs still use @file to avoid shell quoting/argv-length issues.
+  // Fork mode: pass as a direct CLI message so InteractiveMode invokes
+  // session.prompt(...) on startup (instead of only showing a pre-appended user turn).
+  // Non-fork mode keeps @file to avoid shell-quoting/argv-length issues.
   if (params.fork) {
-    appendUserTextMessage(subagentSessionFile, fullTask);
+    parts.push(shellEscape(fullTask));
   } else {
     const sessionId = ctx.sessionManager.getSessionId();
     const artifactDir = getArtifactDir(ctx.cwd, sessionId);
@@ -766,7 +760,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   );
 
   // Depth gating: main session exposes agent_group, spawned agents expose subagent
-  const isInsideSubagent = !!process.env.PI_SUBAGENT_AGENT;
+  // Raw forks set PI_SUBAGENT_NAME, typed forks also set PI_SUBAGENT_AGENT.
+  const isInsideSubagent = !!(process.env.PI_SUBAGENT_NAME || process.env.PI_SUBAGENT_AGENT);
   const shouldRegister = (name: string) => {
     if (deniedTools.has(name)) return false;
     if (name === "subagent" && !isInsideSubagent) return false;
@@ -799,11 +794,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           content: [{ type: "text", text: `You are the ${currentAgent} agent — do not start another ${currentAgent}. You were spawned to do this work yourself. Complete the task directly.` }],
           details: { error: "self-spawn blocked" },
         };
-      }
-
-      // Validate prerequisites
-      if (!isMuxAvailable()) {
-        return muxUnavailableResult("subagents");
       }
 
       if (!ctx.sessionManager.getSessionFile()) {
@@ -842,7 +832,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `Sub-agent "${params.name}" launched and running in the background. Results will return automatically in this session. Inform the user and wait; only call status/nudge tools if the user explicitly asks.`,
+          text: `Sub-agent "${params.name}" launched and running in the background. Results will return automatically in this session. Inform the user and wait; only call status/nudge tools if the user explicitly asks.${compatModeNote()}`,
         }],
         details: {
           id: running.id,
@@ -923,10 +913,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     parameters: AgentGroupParams,
 
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      if (!isMuxAvailable()) {
-        return muxUnavailableResult("subagents");
-      }
-
       if (!ctx.sessionManager.getSessionFile()) {
         return {
           content: [{ type: "text", text: "Error: no session file. Start pi with a persistent session to use subagents." }],
@@ -1009,7 +995,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `${groupName} launched with ${started.length} subagents. The grouped result will return automatically when all are done. Inform the user and wait; only poll or nudge if the user explicitly asks.`,
+          text: `${groupName} launched with ${started.length} subagents. The grouped result will return automatically when all are done. Inform the user and wait; only poll or nudge if the user explicitly asks.${compatModeNote()}`,
         }],
         details: {
           name: groupName,
@@ -1084,10 +1070,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     parameters: ActiveSubagentsParams,
 
     async execute(_toolCallId, params) {
-      if (!isMuxAvailable()) {
-        return muxUnavailableResult("subagents");
-      }
-
       const screenLines = Math.max(0, Math.min(200, params.screenLines ?? 0));
       const agents = getRunningSubagentsSnapshot().map((agent) => {
         let screen: string | undefined;
@@ -1167,10 +1149,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     parameters: MessageSubagentParams,
 
     async execute(_toolCallId, params) {
-      if (!isMuxAvailable()) {
-        return muxUnavailableResult("subagents");
-      }
-
       let running: RunningSubagent | null;
       try {
         running = findRunningSubagent(params.target);
@@ -1206,6 +1184,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         `Surface: ${running.surface}`,
         `Message: ${params.message}`,
       ];
+      if (isCompatMode()) {
+        contentLines.push("", "⚠️ Compatibility mode: message sent via stdin. Interactive responses may not work without a terminal multiplexer.");
+      }
       if (screen) {
         contentLines.push("", "Recent screen:", screen);
       }
@@ -1343,15 +1324,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params) {
-      if (!isMuxAvailable()) {
-        return muxUnavailableResult("tab-title");
-      }
       try {
         renameCurrentTab(params.title);
         renameWorkspace(params.title);
+        const note = isNonVisualMode() ? " (no visual panes — terminal escape)" : "";
         return {
-          content: [{ type: "text", text: `Title set to: ${params.title}` }],
-          details: { title: params.title },
+          content: [{ type: "text", text: `Title set to: ${params.title}${note}` }],
+          details: { title: params.title, nonVisual: isNonVisualMode() },
         };
       } catch (err: any) {
         return {
@@ -1412,10 +1391,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate) {
       const name = params.name ?? "Resume";
       const startTime = Date.now();
-
-      if (!isMuxAvailable()) {
-        return muxUnavailableResult("subagents");
-      }
 
       if (!existsSync(params.sessionPath)) {
         return {
@@ -1530,10 +1505,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     parameters: SelfForkParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      if (!isMuxAvailable()) {
-        return muxUnavailableResult("subagents");
-      }
-
       const sessionFile = ctx.sessionManager.getSessionFile();
       if (!sessionFile) {
         return {
@@ -1548,18 +1519,27 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       // Launch all forks
       for (let i = 0; i < trackCount; i++) {
         const track = params.tracks[i];
-        const otherTracks = params.tracks
-          .filter((_, j) => j !== i)
-          .map((t) => t.name)
-          .join(", ");
 
-        const forkPrompt = [
-          `You are fork "${track.name}" (${i + 1}/${trackCount}).`,
-          `Your task: ${track.prompt}`,
-          `Other tracks running in parallel: ${otherTracks}.`,
-          `Work independently on your track only. Do not attempt work belonging to the other tracks.`,
-          `When done, write a concise summary of what you accomplished and any changes you made.`,
-        ].join(" ");
+        let forkPrompt: string;
+        if (trackCount === 1) {
+          // Single-track fork: no parallel context needed
+          forkPrompt = [
+            `Your task: ${track.prompt}`,
+            `When done, write a concise summary of what you accomplished and any changes you made.`,
+          ].join(" ");
+        } else {
+          const otherTracks = params.tracks
+            .filter((_, j) => j !== i)
+            .map((t) => t.name)
+            .join(", ");
+          forkPrompt = [
+            `You are fork "${track.name}" (${i + 1}/${trackCount}).`,
+            `Your task: ${track.prompt}`,
+            `Other tracks running in parallel: ${otherTracks}.`,
+            `Work independently on your track only. Do not attempt work belonging to the other tracks.`,
+            `When done, write a concise summary of what you accomplished and any changes you made.`,
+          ].join(" ");
+        }
 
         const running = await launchSubagent(
           {
@@ -1584,25 +1564,35 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       startWidgetRefresh();
 
-      // Block: await ALL forks
-      const results: SubagentResult[] = [];
-      for (let i = 0; i < started.length; i++) {
-        const running = started[i];
-        const result = await watchSubagent(running, running.abortController!.signal);
-        results.push(result);
-        updateWidget();
+      // Block: await ALL forks concurrently.
+      // Keep final results in track order, but stream progress as each one finishes.
+      const resultsByIndex: Array<SubagentResult | undefined> = new Array(trackCount);
+      let done = 0;
 
-        // Stream progress back
-        const done = results.length;
-        const remaining = trackCount - done;
-        onUpdate?.({
-          content: [{
-            type: "text",
-            text: `selffork: ${done}/${trackCount} tracks done${remaining > 0 ? `, ${remaining} running...` : ", all complete."}`,
-          }],
-          details: { done, total: trackCount, results: [...results] },
-        });
-      }
+      const watchTasks = started.map((running, index) =>
+        watchSubagent(running, running.abortController!.signal).then((result) => {
+          resultsByIndex[index] = result;
+          done += 1;
+          updateWidget();
+
+          const remaining = trackCount - done;
+          onUpdate?.({
+            content: [{
+              type: "text",
+              text: `selffork: ${done}/${trackCount} tracks done${remaining > 0 ? `, ${remaining} running...` : ", all complete."}`,
+            }],
+            details: {
+              done,
+              total: trackCount,
+              results: resultsByIndex.filter((r): r is SubagentResult => !!r),
+            },
+          });
+
+          return result;
+        })
+      );
+
+      const results = await Promise.all(watchTasks);
 
       // Build combined output
       const successCount = results.filter((r) => r.exitCode === 0).length;
@@ -1714,10 +1704,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     ctx: ExtensionContext,
     label: string,
   ) {
-    if (!isMuxAvailable()) {
-      ctx.ui.notify(`${muxSetupHint()}`, "error");
-      return;
-    }
     if (!ctx.sessionManager.getSessionFile()) {
       ctx.ui.notify("No session file — start pi with a persistent session.", "error");
       return;
@@ -1919,14 +1905,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       // Rename workspace and tab to show this is a planning session
-      if (isMuxAvailable()) {
-        try {
-          const label = task.length > 40 ? task.slice(0, 40) + "..." : task;
-          renameWorkspace(`🎯 ${label}`);
-          renameCurrentTab(`🎯 Plan: ${label}`);
-        } catch {
-          // non-critical -- do not block the plan
-        }
+      try {
+        const label = task.length > 40 ? task.slice(0, 40) + "..." : task;
+        renameWorkspace(`🎯 ${label}`);
+        renameCurrentTab(`🎯 Plan: ${label}`);
+      } catch {
+        // non-critical -- do not block the plan
       }
 
       // Load the plan skill from the subagents extension directory
