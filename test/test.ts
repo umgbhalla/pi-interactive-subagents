@@ -1,6 +1,12 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  mkdirSync,
+  rmSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -100,8 +106,17 @@ const ASSISTANT_TOOL_ONLY = {
   message: {
     role: "assistant",
     content: [
-      { type: "thinking", thinking: "Let me think...", thinkingSignature: "abc123" },
-      { type: "toolCall", id: "toolu_1", name: "active_subagents", arguments: { screenLines: 50 } },
+      {
+        type: "thinking",
+        thinking: "Let me think...",
+        thinkingSignature: "abc123",
+      },
+      {
+        type: "toolCall",
+        id: "toolu_1",
+        name: "active_subagents",
+        arguments: { screenLines: 50 },
+      },
     ],
   },
 };
@@ -142,7 +157,12 @@ describe("session.ts", () => {
 
   describe("getLeafId", () => {
     it("returns last entry id", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+        ASSISTANT_MSG,
+      ]);
       assert.equal(getLeafId(file), "asst-001");
     });
 
@@ -155,7 +175,11 @@ describe("session.ts", () => {
 
   describe("getEntryCount", () => {
     it("counts non-empty lines", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG]);
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+      ]);
       assert.equal(getEntryCount(file), 3);
     });
 
@@ -168,7 +192,12 @@ describe("session.ts", () => {
 
   describe("getNewEntries", () => {
     it("returns entries after a given line", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+        ASSISTANT_MSG,
+      ]);
       const entries = getNewEntries(file, 2);
       assert.equal(entries.length, 2);
       assert.equal(entries[0].id, "user-001");
@@ -213,8 +242,17 @@ describe("session.ts", () => {
 
   describe("appendBranchSummary", () => {
     it("appends valid branch_summary entry", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]);
-      const id = appendBranchSummary(file, "user-001", "asst-001", "The plan was created.");
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        USER_MSG,
+        ASSISTANT_MSG,
+      ]);
+      const id = appendBranchSummary(
+        file,
+        "user-001",
+        "asst-001",
+        "The plan was created.",
+      );
 
       assert.ok(id, "should return an id");
       assert.equal(typeof id, "string");
@@ -244,14 +282,24 @@ describe("session.ts", () => {
 
   describe("appendUserTextMessage", () => {
     it("appends a plain user text turn to the current leaf", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+        ASSISTANT_MSG,
+      ]);
       const id = appendUserTextMessage(file, "fork task here");
-      const entries = readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      const entries = readFileSync(file, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
       const appended = entries.at(-1);
       assert.equal(appended.id, id);
       assert.equal(appended.parentId, "asst-001");
       assert.equal(appended.message.role, "user");
-      assert.deepEqual(appended.message.content, [{ type: "text", text: "fork task here" }]);
+      assert.deepEqual(appended.message.content, [
+        { type: "text", text: "fork task here" },
+      ]);
     });
   });
 
@@ -273,8 +321,17 @@ describe("session.ts", () => {
       // Source starts with same base (2 entries), then has 1 new entry
       const sourceFile = join(dir, "merge-source.jsonl");
       const targetFile = join(dir, "merge-target.jsonl");
-      writeFileSync(sourceFile, [SESSION_HEADER, USER_MSG, ASSISTANT_MSG].map(e => JSON.stringify(e)).join("\n") + "\n");
-      writeFileSync(targetFile, [SESSION_HEADER, USER_MSG].map(e => JSON.stringify(e)).join("\n") + "\n");
+      writeFileSync(
+        sourceFile,
+        [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]
+          .map((e) => JSON.stringify(e))
+          .join("\n") + "\n",
+      );
+      writeFileSync(
+        targetFile,
+        [SESSION_HEADER, USER_MSG].map((e) => JSON.stringify(e)).join("\n") +
+          "\n",
+      );
 
       // Merge entries after line 2 (the shared base)
       const merged = mergeNewEntries(sourceFile, targetFile, 2);
@@ -301,29 +358,41 @@ describe("session.ts", () => {
 
       writeSanitizedForkSession(file, out);
 
-      const entries = readFileSync(out, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      const entries = readFileSync(out, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
       assert.equal(entries.length, 5);
       assert.equal(entries.at(-1)?.id, "asst-002");
 
       const assistantTool = entries[2];
-      assert.deepEqual(assistantTool.message.content, [{
-        type: "toolCall",
-        id: "toolu_1",
-        name: "active_subagents",
-        arguments: {},
-      }]);
+      assert.deepEqual(assistantTool.message.content, [
+        {
+          type: "toolCall",
+          id: "toolu_1",
+          name: "active_subagents",
+          arguments: {},
+        },
+      ]);
 
       const noisyTool = entries[3];
       assert.equal(noisyTool.message.toolName, "active_subagents");
-      assert.equal(noisyTool.message.content[0].text, "[active_subagents output omitted]");
+      assert.equal(
+        noisyTool.message.content[0].text,
+        "[active_subagents output omitted]",
+      );
       assert.equal(noisyTool.message.details, undefined);
 
       const assistantText = entries[4];
-      assert.deepEqual(assistantText.message.content, [{ type: "text", text: "Updated plan with details." }]);
+      assert.deepEqual(assistantText.message.content, [
+        { type: "text", text: "Updated plan with details." },
+      ]);
     });
 
     it("keeps regular tool output but truncates and removes extra metadata", () => {
-      const longOutput = Array.from({ length: 40 }, (_, i) => `line ${i}`).join("\n");
+      const longOutput = Array.from({ length: 40 }, (_, i) => `line ${i}`).join(
+        "\n",
+      );
       const file = createSessionFile(dir, [
         SESSION_HEADER,
         USER_MSG,
@@ -346,7 +415,10 @@ describe("session.ts", () => {
 
       writeSanitizedForkSession(file, out);
 
-      const entries = readFileSync(out, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      const entries = readFileSync(out, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
       const tool = entries[2];
       assert.equal(tool.message.toolName, "bash");
       assert.equal(tool.message.details, undefined);
@@ -379,25 +451,37 @@ describe("model-hints.ts", () => {
 
   describe("modelMatchesHintFamily", () => {
     it("matches anthropic models for frontend work", () => {
-      assert.equal(modelMatchesHintFamily("anthropic/claude-sonnet-4-6", "frontend"), true);
-      assert.equal(modelMatchesHintFamily("openai-codex/gpt-5.4", "frontend"), false);
+      assert.equal(
+        modelMatchesHintFamily("anthropic/claude-sonnet-4-7", "frontend"),
+        true,
+      );
+      assert.equal(
+        modelMatchesHintFamily("openai-codex/gpt-5.4", "frontend"),
+        false,
+      );
     });
 
     it("matches codex/gpt models for non-frontend work", () => {
-      assert.equal(modelMatchesHintFamily("openai-codex/gpt-5.4", "non-frontend"), true);
-      assert.equal(modelMatchesHintFamily("anthropic/claude-opus-4-6", "non-frontend"), false);
+      assert.equal(
+        modelMatchesHintFamily("openai-codex/gpt-5.4", "non-frontend"),
+        true,
+      );
+      assert.equal(
+        modelMatchesHintFamily("anthropic/claude-opus-4-7", "non-frontend"),
+        false,
+      );
     });
   });
 
   describe("resolveHintedModel", () => {
     it("keeps explicit model overrides", () => {
       const resolved = resolveHintedModel({
-        explicitModel: "anthropic/claude-opus-4-6",
+        explicitModel: "anthropic/claude-opus-4-7",
         modelHint: "non-frontend",
         agentDefaults: { model: "openai-codex/gpt-5.4" },
       });
       assert.deepEqual(resolved, {
-        model: "anthropic/claude-opus-4-6",
+        model: "anthropic/claude-opus-4-7",
         modelHint: "non-frontend",
       });
     });
@@ -407,11 +491,11 @@ describe("model-hints.ts", () => {
         modelHint: "frontend",
         agentDefaults: {
           model: "openai-codex/gpt-5.4",
-          frontendModel: "anthropic/claude-opus-4-6",
+          frontendModel: "anthropic/claude-opus-4-7",
         },
       });
       assert.deepEqual(resolved, {
-        model: "anthropic/claude-opus-4-6",
+        model: "anthropic/claude-opus-4-7",
         modelHint: "frontend",
       });
     });
@@ -430,7 +514,7 @@ describe("model-hints.ts", () => {
     it("falls back to package defaults when the agent default is the wrong family", () => {
       const resolved = resolveHintedModel({
         modelHint: "non-frontend",
-        agentDefaults: { model: "anthropic/claude-opus-4-6" },
+        agentDefaults: { model: "anthropic/claude-opus-4-7" },
       });
       assert.deepEqual(resolved, {
         model: "openai-codex/gpt-5.4",
@@ -452,14 +536,29 @@ describe("task-artifact.ts", () => {
   });
 
   it("builds sanitized markdown artifact paths", () => {
-    const path = buildSubagentTaskArtifactPath(dir, "Fork: provider-inventory", new Date("2026-04-13T07:34:28.680Z"));
-    assert.equal(path, join(dir, "context/fork-provider-inventory-2026-04-13T07-34-28.md"));
+    const path = buildSubagentTaskArtifactPath(
+      dir,
+      "Fork: provider-inventory",
+      new Date("2026-04-13T07:34:28.680Z"),
+    );
+    assert.equal(
+      path,
+      join(dir, "context/fork-provider-inventory-2026-04-13T07-34-28.md"),
+    );
   });
 
   it("writes task content to a file-backed prompt artifact", () => {
-    const path = writeSubagentTaskArtifact(dir, "Fork: provider-inventory", "very long prompt", new Date("2026-04-13T07:34:28.680Z"));
+    const path = writeSubagentTaskArtifact(
+      dir,
+      "Fork: provider-inventory",
+      "very long prompt",
+      new Date("2026-04-13T07:34:28.680Z"),
+    );
     assert.equal(readFileSync(path, "utf8"), "very long prompt");
-    assert.equal(path, join(dir, "context/fork-provider-inventory-2026-04-13T07-34-28.md"));
+    assert.equal(
+      path,
+      join(dir, "context/fork-provider-inventory-2026-04-13T07-34-28.md"),
+    );
   });
 });
 
@@ -501,7 +600,7 @@ describe("cmux.ts", () => {
       assert.ok(backend !== null, "getMuxBackend() should never return null");
       assert.ok(
         ["supaterm", "cmux", "zellij", "screen", "compat"].includes(backend),
-        `Unknown backend: ${backend}`
+        `Unknown backend: ${backend}`,
       );
     });
 
@@ -513,7 +612,10 @@ describe("cmux.ts", () => {
     it("createSurface returns compat id when in raw compat mode", () => {
       if (!isCompatMode()) return; // skip when screen or a real mux is available
       const surface = createSurface("test-compat");
-      assert.ok(surface.startsWith("compat:"), `Expected compat:N, got ${surface}`);
+      assert.ok(
+        surface.startsWith("compat:"),
+        `Expected compat:N, got ${surface}`,
+      );
     });
 
     it("compat lifecycle: create → sendCommand → readScreen → close", async () => {
@@ -527,7 +629,7 @@ describe("cmux.ts", () => {
       const output = readScreen(surface, 10);
       assert.ok(
         output.includes("HELLO_FROM_COMPAT"),
-        `Expected output to contain HELLO_FROM_COMPAT, got: ${output}`
+        `Expected output to contain HELLO_FROM_COMPAT, got: ${output}`,
       );
 
       closeSurface(surface);
@@ -543,7 +645,7 @@ describe("cmux.ts", () => {
       const output = readScreen(surface, 10);
       assert.ok(
         output.includes("__SUBAGENT_DONE_0__"),
-        `Expected sentinel in output, got: ${output}`
+        `Expected sentinel in output, got: ${output}`,
       );
 
       closeSurface(surface);
@@ -555,7 +657,10 @@ describe("cmux.ts", () => {
       const backend = getMuxBackend();
       if (backend !== "screen") return;
       const surface = createSurface("test-screen");
-      assert.ok(surface.startsWith("screen:"), `Expected screen:..., got ${surface}`);
+      assert.ok(
+        surface.startsWith("screen:"),
+        `Expected screen:..., got ${surface}`,
+      );
       closeSurface(surface); // clean up
     });
 
@@ -566,7 +671,10 @@ describe("cmux.ts", () => {
       const surface = createSurface("screen-echo-test");
       assert.ok(surface.startsWith("screen:"));
 
-      sendCommand(surface, 'echo "HELLO_FROM_SCREEN"; echo "__SUBAGENT_DONE_0__"');
+      sendCommand(
+        surface,
+        'echo "HELLO_FROM_SCREEN"; echo "__SUBAGENT_DONE_0__"',
+      );
 
       // Screen needs time to start the session and run the command
       await new Promise<void>((r) => setTimeout(r, 2000));
@@ -574,15 +682,14 @@ describe("cmux.ts", () => {
       const output = readScreen(surface, 20);
       assert.ok(
         output.includes("HELLO_FROM_SCREEN"),
-        `Expected output to contain HELLO_FROM_SCREEN, got: ${output}`
+        `Expected output to contain HELLO_FROM_SCREEN, got: ${output}`,
       );
       assert.ok(
         output.includes("__SUBAGENT_DONE_0__"),
-        `Expected sentinel in output, got: ${output}`
+        `Expected sentinel in output, got: ${output}`,
       );
 
       closeSurface(surface);
     });
   });
-
 });

@@ -57,13 +57,13 @@ const AgentGroupParams = Type.Object({
   // wait param removed — agent_group is always async
 });
 
-const SelfForkTrack = Type.Object({
+const BranchTrack = Type.Object({
   name: Type.String({ description: "Short label for this track (e.g. 'optimize queries', 'refactor auth')" }),
   prompt: Type.String({ description: "What to work on in this track. The fork gets full conversation context plus this prompt." }),
 });
 
-const SelfForkParams = Type.Object({
-  tracks: Type.Array(SelfForkTrack, {
+const BranchParams = Type.Object({
+  tracks: Type.Array(BranchTrack, {
     minItems: 1,
     maxItems: 8,
     description: "Tracks to fork into. Each track gets a full copy of the current conversation and runs independently. A single track creates a blocking context-preserving fork.",
@@ -77,12 +77,6 @@ const SelfForkParams = Type.Object({
 
 const ActiveSubagentsParams = Type.Object({
   screenLines: Type.Optional(Type.Number({ description: "Include the last N lines of terminal output for each running subagent. Default: 0.", minimum: 0, maximum: 200 })),
-});
-
-const MessageSubagentParams = Type.Object({
-  target: Type.String({ description: "Running subagent id, exact name, or unique case-insensitive name prefix." }),
-  message: Type.String({ description: "Message to send into the running subagent session." }),
-  screenLines: Type.Optional(Type.Number({ description: "Include the last N lines of terminal output after sending the message. Default: 30.", minimum: 0, maximum: 200 })),
 });
 
 interface AgentDefaults {
@@ -99,7 +93,7 @@ interface AgentDefaults {
 }
 
 /** Tools that are gated by `spawning: false` */
-const SPAWNING_TOOLS = new Set(["subagent", "agent_group", "selffork", "subagents_list", "subagent_resume", "active_subagents", "message_subagent"]);
+const SPAWNING_TOOLS = new Set(["subagent", "agent_group", "branch", "subagents_list", "active_subagents"]);
 
 /**
  * Resolve the effective set of denied tool names from agent defaults.
@@ -424,11 +418,6 @@ async function launchSubagent(
   const summaryInstruction =
     "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
   const denySet = resolveDenyTools(agentDefs);
-  const agentType = params.agent ?? params.name;
-  const tabTitleInstruction = denySet.has("set_tab_title") ? "" :
-    `As your FIRST action, set the tab title using set_tab_title. ` +
-    `The title MUST start with [${agentType}] followed by a short description of your current task. ` +
-    `Example: "[${agentType}] Analyzing auth module". Keep it concise.`;
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const roleBlock = identity ? `\n\n${identity}` : "";
 
@@ -437,7 +426,6 @@ async function launchSubagent(
       ? "Continue from the current conversation context. For this fork only, adopt the following role and constraints:"
       : "Continue from the current conversation context.",
     identity,
-    tabTitleInstruction,
     modeHint,
     params.task,
     summaryInstruction,
@@ -445,7 +433,7 @@ async function launchSubagent(
 
   const fullTask = params.fork
     ? typedForkTask
-    : `${roleBlock}\n\n${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}\n\n${summaryInstruction}`;
+    : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
 
   // Build pi command
   const parts: string[] = ["pi"];
@@ -712,30 +700,6 @@ function getRunningSubagentsSnapshot() {
     bytes: running.bytes,
   }));
 }
-
-function findRunningSubagent(target: string): RunningSubagent | null {
-  const query = target.trim();
-  if (!query) return null;
-
-  if (runningSubagents.has(query)) {
-    return runningSubagents.get(query)!;
-  }
-
-  const lower = query.toLowerCase();
-  const exactMatches = [...runningSubagents.values()].filter((running) => running.name.toLowerCase() === lower);
-  if (exactMatches.length === 1) return exactMatches[0];
-  if (exactMatches.length > 1) throw new Error(`Multiple running subagents match name \"${target}\"`);
-
-  const prefixMatches = [...runningSubagents.values()].filter((running) => running.name.toLowerCase().startsWith(lower));
-  if (prefixMatches.length === 1) return prefixMatches[0];
-  if (prefixMatches.length > 1) {
-    throw new Error(`Multiple running subagents match prefix \"${target}\": ${prefixMatches.map((r) => r.name).join(", ")}`);
-  }
-
-  return null;
-}
-
-
 export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
@@ -759,17 +723,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     (process.env.PI_DENY_TOOLS ?? "").split(",").map((s) => s.trim()).filter(Boolean)
   );
 
-  // Depth gating: main session exposes agent_group, spawned agents expose subagent
+  // Depth gating: subagent is available everywhere, agent_group only in the main session.
   // Raw forks set PI_SUBAGENT_NAME, typed forks also set PI_SUBAGENT_AGENT.
   const isInsideSubagent = !!(process.env.PI_SUBAGENT_NAME || process.env.PI_SUBAGENT_AGENT);
   const shouldRegister = (name: string) => {
     if (deniedTools.has(name)) return false;
-    if (name === "subagent" && !isInsideSubagent) return false;
     if (name === "agent_group" && isInsideSubagent) return false;
     return true;
   };
 
-  // ── subagent tool (only available inside spawned agents for nesting) ──
+  // ── subagent tool ──
   shouldRegister("subagent") && pi.registerTool({
     name: "subagent",
     label: "Subagent",
@@ -1136,98 +1099,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
-  // ── message_subagent tool ──
-  shouldRegister("message_subagent") && pi.registerTool({
-    name: "message_subagent",
-    label: "Message Subagent",
-    description:
-      "Send a message into a running subagent session to nudge or redirect it. " +
-      "Use the subagent id, exact name, or a unique name prefix from active_subagents.",
-    promptSnippet:
-      "Send a message into a running subagent session to nudge or redirect it. " +
-      "Use the subagent id, exact name, or a unique name prefix from active_subagents.",
-    parameters: MessageSubagentParams,
-
-    async execute(_toolCallId, params) {
-      let running: RunningSubagent | null;
-      try {
-        running = findRunningSubagent(params.target);
-      } catch (err: any) {
-        return {
-          content: [{ type: "text", text: err?.message ?? String(err) }],
-          details: { error: err?.message ?? String(err) },
-        };
-      }
-
-      if (!running) {
-        return {
-          content: [{ type: "text", text: `No running subagent matched: ${params.target}` }],
-          details: { error: "not found", target: params.target },
-        };
-      }
-
-      sendCommand(running.surface, params.message);
-
-      const screenLines = Math.max(0, Math.min(200, params.screenLines ?? 30));
-      let screen = "";
-      if (screenLines > 0) {
-        try {
-          screen = readScreen(running.surface, screenLines).trim();
-        } catch (err: any) {
-          screen = `[screen unavailable: ${err?.message ?? String(err)}]`;
-        }
-      }
-
-      const contentLines = [
-        `Sent message to ${running.name}${running.agent ? ` (${running.agent})` : ""}.`,
-        `Target id: ${running.id}`,
-        `Surface: ${running.surface}`,
-        `Message: ${params.message}`,
-      ];
-      if (isCompatMode()) {
-        contentLines.push("", "⚠️ Compatibility mode: message sent via stdin. Interactive responses may not work without a terminal multiplexer.");
-      }
-      if (screen) {
-        contentLines.push("", "Recent screen:", screen);
-      }
-
-      return {
-        content: [{ type: "text", text: contentLines.join("\n") }],
-        details: {
-          id: running.id,
-          name: running.name,
-          agent: running.agent,
-          surface: running.surface,
-          message: params.message,
-          screen,
-        },
-      };
-    },
-
-    renderCall(args, theme) {
-      return new Text(
-        "▸ " +
-        theme.fg("toolTitle", theme.bold(args.target ?? "subagent")) +
-        theme.fg("dim", " — sending message"),
-        0, 0,
-      );
-    },
-
-    renderResult(result, _opts, theme) {
-      const details = result.details as any;
-      if (details?.error) {
-        return new Text(theme.fg("error", details.error), 0, 0);
-      }
-      const name = details?.name ?? "subagent";
-      return new Text(
-        theme.fg("accent", "▸") + " " +
-        theme.fg("toolTitle", theme.bold(name)) +
-        theme.fg("dim", " — message sent"),
-        0, 0,
-      );
-    },
-  });
-
   // ── subagents_list tool ──
   shouldRegister("subagents_list") && pi.registerTool({
     name: "subagents_list",
@@ -1309,206 +1180,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
-  // ── set_tab_title tool ──
-  shouldRegister("set_tab_title") && pi.registerTool({
-    name: "set_tab_title",
-    label: "Set Tab Title",
+  // ── branch tool (main session only — blocking context-preserving fork) ──
+  shouldRegister("branch") && !isInsideSubagent && pi.registerTool({
+    name: "branch",
+    label: "Branch",
     description:
-      "Update the current tab/window and workspace/session title. Use to show progress during multi-phase workflows " +
-      "(e.g. planning, executing todos, reviewing). Keep titles short and informative.",
-    promptSnippet:
-      "Update the current tab/window and workspace/session title. Use to show progress during multi-phase workflows " +
-      "(e.g. planning, executing todos, reviewing). Keep titles short and informative.",
-    parameters: Type.Object({
-      title: Type.String({ description: "New tab title (also applied to workspace/session when supported)" }),
-    }),
-
-    async execute(_toolCallId, params) {
-      try {
-        renameCurrentTab(params.title);
-        renameWorkspace(params.title);
-        const note = isNonVisualMode() ? " (no visual panes — terminal escape)" : "";
-        return {
-          content: [{ type: "text", text: `Title set to: ${params.title}${note}` }],
-          details: { title: params.title, nonVisual: isNonVisualMode() },
-        };
-      } catch (err: any) {
-        return {
-          content: [{ type: "text", text: `Failed to set title: ${err?.message}` }],
-          details: { error: err?.message },
-        };
-      }
-    },
-  });
-
-  // ── subagent_resume tool ──
-  shouldRegister("subagent_resume") && pi.registerTool({
-    name: "subagent_resume",
-    label: "Resume Subagent",
-    description:
-      "Resume a previous sub-agent session in a new multiplexer pane. " +
-      "Returns immediately — the resumed session runs in the background and steers results back when done. " +
-      "After launch, inform the user and wait; do not poll unless explicitly asked. " +
-      "Use when a sub-agent was cancelled or needs follow-up work.",
-    promptSnippet:
-      "Resume a previous sub-agent session in a new multiplexer pane. " +
-      "Returns immediately — the resumed session runs in the background and steers results back when done. " +
-      "After launch, inform the user and wait; do not poll unless explicitly asked. " +
-      "Use when a sub-agent was cancelled or needs follow-up work.",
-    parameters: Type.Object({
-      sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
-      name: Type.Optional(Type.String({ description: "Display name for the terminal tab. Default: 'Resume'" })),
-      message: Type.Optional(Type.String({ description: "Optional message to send after resuming (e.g. follow-up instructions)" })),
-    }),
-
-    renderCall(args, theme) {
-      const name = args.name ?? "Resume";
-      const text =
-        "▸ " +
-        theme.fg("toolTitle", theme.bold(name)) +
-        theme.fg("dim", " — resuming session");
-      return new Text(text, 0, 0);
-    },
-
-    renderResult(result, _opts, theme) {
-      const details = result.details as any;
-      const name = details?.name ?? "Resume";
-
-      if (details?.status === "started") {
-        return new Text(
-          theme.fg("accent", "▸") + " " +
-          theme.fg("toolTitle", theme.bold(name)) +
-          theme.fg("dim", " — resumed (auto-return)"),
-          0, 0
-        );
-      }
-
-      // Fallback
-      const text = typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
-      return new Text(theme.fg("dim", text), 0, 0);
-    },
-
-    async execute(_toolCallId, params, _signal, _onUpdate) {
-      const name = params.name ?? "Resume";
-      const startTime = Date.now();
-
-      if (!existsSync(params.sessionPath)) {
-        return {
-          content: [{ type: "text", text: `Error: session file not found: ${params.sessionPath}` }],
-          details: { error: "session not found" },
-        };
-      }
-
-      // Record entry count before resuming so we can extract new messages
-      const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
-
-      const surface = createSurface(name);
-      await new Promise<void>((resolve) => setTimeout(resolve, 500));
-
-      // Build pi resume command
-      const parts = ["pi", "--session", shellEscape(params.sessionPath)];
-
-      // Load subagent-done extension so the agent can self-terminate if needed
-      const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
-      parts.push("-e", shellEscape(subagentDonePath));
-
-      let cleanupMsgFile: string | undefined;
-      if (params.message) {
-        const msgFile = join(tmpdir(), `subagent-resume-${Date.now()}.md`);
-        writeFileSync(msgFile, params.message, "utf8");
-        cleanupMsgFile = msgFile;
-        parts.push(`@${shellEscape(msgFile)}`);
-      }
-
-      const command = `${parts.join(" ")}${cleanupMsgFile ? `; rm -f ${shellEscape(cleanupMsgFile)}` : ""}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
-      sendCommand(surface, command);
-
-      // Register as a running subagent for widget tracking
-      const id = Math.random().toString(16).slice(2, 10);
-      const running: RunningSubagent = {
-        id,
-        name,
-        task: params.message ?? "resumed session",
-        surface,
-        startTime,
-        sessionFile: params.sessionPath,
-      };
-      runningSubagents.set(id, running);
-      startWidgetRefresh();
-
-      // Fire-and-forget watcher
-      const watcherAbort = new AbortController();
-      running.abortController = watcherAbort;
-
-      watchSubagent(running, watcherAbort.signal).then((result) => {
-        updateWidget();
-        const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
-        const summary =
-          findLastAssistantMessage(allEntries) ??
-          (result.exitCode !== 0
-            ? `Resumed session exited with code ${result.exitCode}`
-            : "Resumed session exited without new output");
-        const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
-
-        pi.sendMessage({
-          customType: "subagent_result",
-          content: `${summary}${sessionRef}`,
-          display: true,
-          details: {
-            name,
-            task: params.message ?? "resumed session",
-            exitCode: result.exitCode,
-            elapsed: result.elapsed,
-            sessionFile: params.sessionPath,
-          },
-        }, { triggerTurn: true, deliverAs: "steer" });
-      }).catch((err) => {
-        updateWidget();
-        pi.sendMessage({
-          customType: "subagent_result",
-          content: `Resume error: ${err?.message ?? String(err)}`,
-          display: true,
-          details: { name, error: err?.message },
-        }, { triggerTurn: true, deliverAs: "steer" });
-      });
-
-      return {
-        content: [{
-          type: "text",
-          text: `Session "${name}" resumed in the background. Results will return automatically in this session. Inform the user and wait; only poll or nudge if the user explicitly asks.`,
-        }],
-        details: {
-          id,
-          name,
-          sessionPath: params.sessionPath,
-          status: "started",
-          autoReturn: true,
-          nextAction: "Inform user resume succeeded and wait for automatic result.",
-        },
-      };
-    },
-  });
-
-  // ── selffork tool (main session only — blocking parallel fork) ──
-  shouldRegister("selffork") && !isInsideSubagent && pi.registerTool({
-    name: "selffork",
-    label: "Self-Fork",
-    description:
-      "Fork the current session into parallel tracks that run concurrently. " +
+      "Branch the current session into one or more parallel tracks. " +
       "Each track gets a full copy of the conversation context and works independently in its own terminal pane. " +
-      "This tool BLOCKS until all tracks complete, then returns their combined results. " +
-      "Use when multiple independent workstreams can proceed in parallel from the current state.",
+      "BLOCKS until all tracks complete, then returns their combined results. " +
+      "Prefer branch over agent_group when the task benefits from the accumulated conversation context — " +
+      "agent_group starts fresh sessions, branch carries forward everything discussed so far.",
     promptSnippet:
-      "Fork the current session into parallel tracks. Each track gets full conversation context. " +
+      "Branch the current session into parallel tracks that carry forward the full conversation context. " +
       "BLOCKS until all tracks complete. Returns combined results. " +
-      "Use for parallel independent workstreams.",
-    parameters: SelfForkParams,
+      "Prefer branch when the task needs context from the current conversation (plans, decisions, code discussed). " +
+      "Use agent_group when tasks are independent and don't need prior context. " +
+      "IMPORTANT: commit all pending changes before branching — each track shares the same working directory, so a clean commit point prevents merge conflicts between parallel tracks.",
+    parameters: BranchParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const sessionFile = ctx.sessionManager.getSessionFile();
       if (!sessionFile) {
         return {
-          content: [{ type: "text", text: "Error: no session file. Start pi with a persistent session to use selffork." }],
+          content: [{ type: "text", text: "Error: no session file. Start pi with a persistent session to use branch." }],
           details: { error: "no session file" },
         };
       }
@@ -1579,7 +1273,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           onUpdate?.({
             content: [{
               type: "text",
-              text: `selffork: ${done}/${trackCount} tracks done${remaining > 0 ? `, ${remaining} running...` : ", all complete."}`,
+              text: `branch: ${done}/${trackCount} tracks done${remaining > 0 ? `, ${remaining} running...` : ", all complete."}`,
             }],
             details: {
               done,
@@ -1606,13 +1300,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return `## Fork: ${track.name} [${status}] (${formatElapsed(r.elapsed)})\n\n${r.summary || "(no output)"}${sessionRef}`;
       });
 
-      const header = `Self-fork completed: ${successCount}/${trackCount} succeeded. Wall time: ${formatElapsed(maxElapsed)}.`;
+      const header = `Branch completed: ${successCount}/${trackCount} succeeded. Wall time: ${formatElapsed(maxElapsed)}.`;
       const combined = `${header}\n\n${sections.join("\n\n---\n\n")}`;
 
       return {
         content: [{ type: "text", text: combined }],
         details: {
-          mode: "selffork",
+          mode: "branch",
           total: trackCount,
           completed: successCount,
           failed: trackCount - successCount,
@@ -1633,8 +1327,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const tracks = Array.isArray(args.tracks) ? args.tracks : [];
       let text =
         "▸ " +
-        theme.fg("toolTitle", theme.bold("selffork ")) +
-        theme.fg("accent", `${tracks.length} tracks`);
+        theme.fg("toolTitle", theme.bold("branch ")) +
+        theme.fg("accent", `${tracks.length} track${tracks.length === 1 ? "" : "s"}`);
       for (const t of tracks.slice(0, 5)) {
         const preview = (t.prompt ?? "").length > 60 ? (t.prompt ?? "").slice(0, 60) + "…" : (t.prompt ?? "");
         text += `\n  ${theme.fg("accent", t.name ?? "?")}${theme.fg("dim", ` ${preview}`)}`;
@@ -1659,7 +1353,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         ? `${completed}/${total} succeeded`
         : `${completed}/${total} succeeded, ${failed} failed`;
 
-      const header = `${icon} ${theme.fg("toolTitle", theme.bold("selffork"))} — ${status} ${theme.fg("dim", `(${elapsed})`)}`;
+      const header = `${icon} ${theme.fg("toolTitle", theme.bold("branch"))} — ${status} ${theme.fg("dim", `(${elapsed})`)}`;
 
       if (expanded) {
         const container = new Container();

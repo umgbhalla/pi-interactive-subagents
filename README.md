@@ -143,7 +143,7 @@ flowchart TB
 
     AgentGroup -.->|"loads defaults"| AgentDefs
 
-    ReadScreen -.->|"active_subagents<br/>+ message_subagent"| Sub1
+    ReadScreen -.->|"active_subagents"| Sub1
     ReadScreen -.->|"active_subagents"| Sub2
 
     style Main fill:#1a1a2e,stroke:#4da6ff,color:#fff
@@ -157,7 +157,7 @@ flowchart TB
 
 | Component | File | Purpose |
 |-----------|------|---------|
-| **Subagents extension** | `pi-extension/subagents/index.ts` | Core orchestration — registers tools (`agent_group`, `subagent`, `active_subagents`, `message_subagent`, `subagents_list`, `set_tab_title`, `subagent_resume`, `selffork`), commands (`/plan`, `/iterate`, `/subagent`), and message renderers for result display |
+| **Subagents extension** | `pi-extension/subagents/index.ts` | Core orchestration — registers tools (`agent_group`, `subagent`, `active_subagents`, `subagents_list`, `branch`), commands (`/plan`, `/iterate`, `/subagent`), and message renderers for result display |
 | **Multiplexer layer** | `pi-extension/subagents/cmux.ts` | Backend abstraction — detects Supaterm/cmux/zellij, creates surfaces (tabs/panes), sends commands, reads screen output, polls for exit sentinels |
 | **Session utilities** | `pi-extension/subagents/session.ts` | JSONL session file manipulation — fork sanitization, entry reading, branch summaries, session merging |
 | **Model hints** | `pi-extension/subagents/model-hints.ts` | Resolves `modelHint: "frontend" \| "non-frontend"` to concrete model IDs based on agent defaults and package fallbacks |
@@ -272,14 +272,11 @@ The package registers three pi extensions:
 
 | Tool | Level | Description |
 |------|-------|-------------|
-| `agent_group` | main | Spawn a batch of sub-agents and collect one grouped result |
-| `subagent` | nested | Spawn a single sub-agent (only available inside a group for one-level nesting) |
+| `agent_group` | main | Spawn a batch of fresh sub-agents and collect one grouped result |
+| `subagent` | any | Spawn a single sub-agent in a dedicated terminal pane |
 | `active_subagents` | any | List currently running subagents, optionally with recent screen output |
-| `message_subagent` | any | Send a nudge or follow-up message into a running subagent session |
 | `subagents_list` | any | List available agent definitions |
-| `set_tab_title` | any | Update tab/window title to show progress |
-| `subagent_resume` | any | Resume a previous sub-agent session (async) |
-| `selffork` | main | Fork the current session into parallel blocking tracks |
+| `branch` | main | Fork the current session into parallel tracks with full conversation context |
 
 | Command | Description |
 |---------|-------------|
@@ -287,7 +284,7 @@ The package registers three pi extensions:
 | `/iterate [--agent <name>] <task>` | Fork into a subagent for focused work |
 | `/subagent <agent> [--hint frontend\|non-frontend] <task>` | Spawn a named agent directly |
 
-**Depth gating:** The main session exposes `agent_group`; spawned subagents expose `subagent` instead. This enforces a max delegation depth of 2 (main → subagent → nested subagent) without needing explicit depth counters.
+**Depth gating:** The main session exposes `agent_group` and `branch`; `subagent` is available everywhere. `agent_group` starts fresh sessions (no prior context), while `branch` carries forward the full conversation. Prefer `branch` when accumulated context is needed.
 
 #### 2. Session Artifacts — session-scoped file storage
 
@@ -377,7 +374,7 @@ subagent({ name: "Iterate", fork: true, task: "Fix the bug where..." })
 subagent({ name: "Debugger", agent: "debugger", fork: true, task: "Reproduce the flaky test" })
 
 // Override agent defaults
-subagent({ name: "Worker", agent: "worker", model: "anthropic/claude-opus-4-6", task: "Quick fix..." })
+subagent({ name: "Worker", agent: "worker", model: "anthropic/claude-opus-4-7", task: "Quick fix..." })
 
 // Hint the model family without hardcoding a specific model
 subagent({ name: "Worker", agent: "worker", modelHint: "frontend", task: "Polish the pricing page UI" })
@@ -395,7 +392,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `task` | string | required | Task prompt for the sub-agent |
 | `agent` | string | — | Load defaults from agent definition file |
 | `fork` | boolean | `false` | Copy current session for full context. When combined with `agent`, creates a typed fork: current context + named agent role |
-| `model` | string | — | Override agent's default model (e.g. `anthropic/claude-opus-4-6`) |
+| `model` | string | — | Override agent's default model (e.g. `anthropic/claude-opus-4-7`) |
 | `modelHint` | `"frontend"` \| `"non-frontend"` | — | Hint the model family. `frontend` prefers Claude; `non-frontend` prefers Codex/GPT. Ignored when `model` is set |
 | `systemPrompt` | string | — | Append to system prompt |
 | `skills` | string | — | Comma-separated skill names to auto-load |
@@ -410,15 +407,9 @@ These are for the **outer/orchestrator session** to supervise active work:
 // List running agents with optional screen capture
 active_subagents({ screenLines: 40 })
 
-// Send a nudge to a running agent (by id, name, or name prefix)
-message_subagent({
-  target: "Scout: Auth",
-  message: "Wrap up your findings and call subagent_done.",
-  screenLines: 30,
-})
 ```
 
-Subagents have these control tools denied by default (via `spawning: false`), so only the main session can inspect and nudge.
+Subagents with `spawning: false` have orchestration tools denied by default.
 
 ---
 
@@ -539,7 +530,7 @@ Resolution order (`model-hints.ts:resolveHintedModel`):
 1. **Explicit `model`** → always wins, hint is informational only
 2. **Agent `model-frontend` / `model-non-frontend` frontmatter** → hint-specific override
 3. **Agent default `model`** → used if it already matches the hinted family
-4. **Package defaults** → `anthropic/claude-sonnet-4-6` (frontend) or `openai-codex/gpt-5.4` (non-frontend)
+4. **Package defaults** → `anthropic/claude-sonnet-4-7` (frontend) or `openai-codex/gpt-5.4` (non-frontend)
 
 Accepted aliases: `frontend`, `ui`, `ux`, `design` → `"frontend"` | `non-frontend`, `backend`, `general`, `code`, `coding` → `"non-frontend"`
 
@@ -553,7 +544,7 @@ Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global):
 ---
 name: my-agent
 description: Does something specific
-model: anthropic/claude-sonnet-4-6
+model: anthropic/claude-sonnet-4-7
 thinking: minimal
 tools: read, bash, edit, write
 spawning: false
@@ -572,7 +563,7 @@ The frontmatter configures the agent's defaults. Everything after the `---` fenc
 |-------|------|-------------|
 | `name` | string | Agent name (used in `agent: "my-agent"`) |
 | `description` | string | Shown in `subagents_list` output |
-| `model` | string | Default model (e.g. `anthropic/claude-sonnet-4-6`) |
+| `model` | string | Default model (e.g. `anthropic/claude-sonnet-4-7`) |
 | `model-frontend` / `frontend-model` | string | Model override when `modelHint: "frontend"` |
 | `model-non-frontend` / `non-frontend-model` | string | Model override when `modelHint: "non-frontend"` |
 | `thinking` | string | Thinking level: `minimal`, `medium`, `high` |
@@ -590,7 +581,7 @@ Control what tools subagents can access:
 
 ### `spawning: false`
 
-Denies all spawning-related tools (`subagent`, `agent_group`, `selffork`, `subagents_list`, `subagent_resume`, `active_subagents`, `message_subagent`):
+Denies all spawning-related tools (`subagent`, `agent_group`, `branch`, `subagents_list`, `active_subagents`):
 
 ```yaml
 ---
@@ -606,7 +597,7 @@ Fine-grained control over individual extension tools:
 ```yaml
 ---
 name: focused-agent
-deny-tools: subagent, set_tab_title
+deny-tools: subagent, active_subagents
 ---
 ```
 
@@ -684,7 +675,7 @@ When running inside cmux, the cmux-status extension pushes real-time agent state
 ```
 ┌─────────────────┐
 │ ✓ Idle          │  ← pi_state (green when idle, amber when working)
-│ 🧠 sonnet-4-6   │  ← pi_model
+│ 🧠 sonnet-4-7   │  ← pi_model
 │ ✨ minimal       │  ← pi_thinking
 │ 📊 45.2k tokens │  ← pi_tokens
 │ 💰 $0.23        │  ← pi_cost

@@ -7,11 +7,18 @@ export interface AgentModelDefaults {
 }
 
 const DEFAULT_HINT_MODELS: Record<ModelHint, string> = {
-  frontend: "anthropic/claude-sonnet-4-6",
+  frontend: "anthropic/claude-sonnet-4-7",
   "non-frontend": "openai-codex/gpt-5.4",
 };
 
-const FRONTEND_HINT_ALIASES = new Set(["frontend", "front-end", "ui", "ux", "design", "visual"]);
+const FRONTEND_HINT_ALIASES = new Set([
+  "frontend",
+  "front-end",
+  "ui",
+  "ux",
+  "design",
+  "visual",
+]);
 const NON_FRONTEND_HINT_ALIASES = new Set([
   "non-frontend",
   "non_frontend",
@@ -23,7 +30,9 @@ const NON_FRONTEND_HINT_ALIASES = new Set([
   "coding",
 ]);
 
-export function normalizeModelHint(hint?: string | null): ModelHint | undefined {
+export function normalizeModelHint(
+  hint?: string | null,
+): ModelHint | undefined {
   const normalized = hint?.trim().toLowerCase();
   if (!normalized) return undefined;
   if (FRONTEND_HINT_ALIASES.has(normalized)) return "frontend";
@@ -31,7 +40,10 @@ export function normalizeModelHint(hint?: string | null): ModelHint | undefined 
   return undefined;
 }
 
-export function modelMatchesHintFamily(model: string | undefined, hint: ModelHint): boolean {
+export function modelMatchesHintFamily(
+  model: string | undefined,
+  hint: ModelHint,
+): boolean {
   const normalized = model?.trim().toLowerCase();
   if (!normalized) return false;
 
@@ -39,7 +51,11 @@ export function modelMatchesHintFamily(model: string | undefined, hint: ModelHin
     return normalized.includes("anthropic/") || normalized.includes("claude-");
   }
 
-  return normalized.includes("openai-codex/") || normalized.includes("gpt-") || normalized.includes("codex");
+  return (
+    normalized.includes("openai-codex/") ||
+    normalized.includes("gpt-") ||
+    normalized.includes("codex")
+  );
 }
 
 export function resolveHintedModel(input: {
@@ -58,9 +74,10 @@ export function resolveHintedModel(input: {
     return { model: agentDefaultModel };
   }
 
-  const hintedOverride = modelHint === "frontend"
-    ? agentDefaults?.frontendModel
-    : agentDefaults?.nonFrontendModel;
+  const hintedOverride =
+    modelHint === "frontend"
+      ? agentDefaults?.frontendModel
+      : agentDefaults?.nonFrontendModel;
 
   if (hintedOverride) {
     return { model: hintedOverride, modelHint };

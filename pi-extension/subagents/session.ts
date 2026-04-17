@@ -28,13 +28,10 @@ export interface MessageEntry extends SessionEntry {
 }
 
 const OMIT_FORK_TOOL_RESULTS = new Set([
-  "set_tab_title",
   "active_subagents",
-  "message_subagent",
   "subagent",
   "agent_group",
   "subagents_list",
-  "subagent_resume",
 ]);
 const MAX_FORK_TOOL_RESULT_LINES = 16;
 const MAX_FORK_TOOL_RESULT_CHARS = 1200;
