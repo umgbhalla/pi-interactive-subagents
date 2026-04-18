@@ -1195,7 +1195,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       "BLOCKS until all tracks complete. Returns combined results. " +
       "Prefer branch when the task needs context from the current conversation (plans, decisions, code discussed). " +
       "Use agent_group when tasks are independent and don't need prior context. " +
-      "IMPORTANT: commit all pending changes before branching — each track shares the same working directory, so a clean commit point prevents merge conflicts between parallel tracks.",
+      "IMPORTANT: branch does NOT create a git branch or worktree — do not run `git checkout -b`, `git worktree add`, or switch branches for the tracks. All tracks operate on the same git branch in the shared working directory. " +
+      "Commit all pending changes before calling branch so the tracks start from a clean state, and when the branch completes, commit every track's changes and push to origin on the same branch.",
     parameters: BranchParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
