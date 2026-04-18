@@ -94,6 +94,96 @@ export function isSupatermAvailable(): boolean {
   return isSupatermRuntimeAvailable();
 }
 
+// ── Supaterm capture with retry ─────────────────────────────────────────
+//
+// `sp pane capture` is a thin CLI over an IPC socket to the Supaterm app.
+// Under concurrent load (dozens of subagents polling simultaneously) it can
+// fail transiently with messages like:
+//   Command failed: sp pane capture <surface> --lines 5 --scope scrollback
+//   Error: Failed to read a response from Supaterm.
+//
+// These failures are NOT signals that the pane is dead — they're socket
+// races that clear up on the next tick. Without the retry below, a single
+// transient hiccup would bubble all the way up to index.ts's catch and
+// prematurely declare the entire subagent "failed", causing agent_group
+// runs to collapse en masse even when every subagent is still working.
+
+const SUPATERM_TRANSIENT_PATTERNS = [
+  /failed to read a response from supaterm/i,
+  /connection refused/i,
+  /broken pipe/i,
+  /eagain/i,
+  /etimedout/i,
+];
+
+function isSupatermTransientError(err: unknown): boolean {
+  if (!err) return false;
+  const message =
+    err instanceof Error
+      ? `${err.message}\n${(err as { stderr?: string }).stderr ?? ""}`
+      : String(err);
+  return SUPATERM_TRANSIENT_PATTERNS.some((re) => re.test(message));
+}
+
+const SUPATERM_CAPTURE_ATTEMPTS = Number(
+  process.env.PI_SUBAGENT_SUPATERM_CAPTURE_ATTEMPTS ?? "3",
+);
+const SUPATERM_CAPTURE_BACKOFF_MS = Number(
+  process.env.PI_SUBAGENT_SUPATERM_CAPTURE_BACKOFF_MS ?? "75",
+);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function sleepSync(ms: number): void {
+  // Simple synchronous sleep via Atomics so sync readScreen() callers
+  // still get retry behavior without pulling in a new dep.
+  const buffer = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(buffer), 0, 0, ms);
+}
+
+function supatermCaptureSync(surface: string, lines: number): string {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= SUPATERM_CAPTURE_ATTEMPTS; attempt++) {
+    try {
+      return execFileSync(
+        spBin(),
+        ["pane", "capture", surface, "--lines", String(lines), "--scope", "scrollback"],
+        { encoding: "utf8" },
+      );
+    } catch (err) {
+      lastError = err;
+      if (attempt >= SUPATERM_CAPTURE_ATTEMPTS || !isSupatermTransientError(err)) {
+        break;
+      }
+      sleepSync(SUPATERM_CAPTURE_BACKOFF_MS * attempt);
+    }
+  }
+  throw lastError;
+}
+
+async function supatermCaptureAsync(surface: string, lines: number): Promise<string> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= SUPATERM_CAPTURE_ATTEMPTS; attempt++) {
+    try {
+      const { stdout } = await execFileAsync(
+        spBin(),
+        ["pane", "capture", surface, "--lines", String(lines), "--scope", "scrollback"],
+        { encoding: "utf8" },
+      );
+      return stdout;
+    } catch (err) {
+      lastError = err;
+      if (attempt >= SUPATERM_CAPTURE_ATTEMPTS || !isSupatermTransientError(err)) {
+        break;
+      }
+      await sleep(SUPATERM_CAPTURE_BACKOFF_MS * attempt);
+    }
+  }
+  throw lastError;
+}
+
 // ── cmux detection ──────────────────────────────────────────────────────
 
 function isCmuxRuntimeAvailable(): boolean {
@@ -693,11 +783,7 @@ export function readScreen(surface: string, lines = 50): string {
   }
 
   if (backend === "supaterm") {
-    return execFileSync(spBin(), [
-      "pane", "capture", surface,
-      "--lines", String(lines),
-      "--scope", "scrollback",
-    ], { encoding: "utf8" });
+    return supatermCaptureSync(surface, lines);
   }
 
   if (backend === "cmux") {
@@ -737,12 +823,7 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
   }
 
   if (backend === "supaterm") {
-    const { stdout } = await execFileAsync(spBin(), [
-      "pane", "capture", surface,
-      "--lines", String(lines),
-      "--scope", "scrollback",
-    ], { encoding: "utf8" });
-    return stdout;
+    return supatermCaptureAsync(surface, lines);
   }
 
   if (backend === "cmux") {
@@ -819,13 +900,38 @@ export async function pollForExit(
   options: { interval: number; onTick?: (elapsed: number) => void }
 ): Promise<number> {
   const start = Date.now();
+  // Budget for consecutive screen-read failures before we give up. At the
+  // default 1s poll interval this is ~30s of complete screen-read failure
+  // before we surface an error. Short enough to catch a truly dead pane,
+  // long enough to ride out Supaterm socket contention.
+  const maxConsecutiveReadErrors = Number(
+    process.env.PI_SUBAGENT_POLL_MAX_READ_ERRORS ?? "30",
+  );
+  let consecutiveReadErrors = 0;
+  let lastReadError: unknown;
 
   while (true) {
     if (signal.aborted) {
       throw new Error("Aborted while waiting for subagent to finish");
     }
 
-    const screen = await readScreenAsync(surface, 5);
+    let screen: string;
+    try {
+      screen = await readScreenAsync(surface, 5);
+      consecutiveReadErrors = 0;
+    } catch (err) {
+      consecutiveReadErrors += 1;
+      lastReadError = err;
+      if (consecutiveReadErrors >= maxConsecutiveReadErrors) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Lost screen access to pane ${surface} (${consecutiveReadErrors} consecutive read errors): ${msg}`,
+        );
+      }
+      // Skip this tick; the pane may still be running.
+      screen = "";
+    }
+
     const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
     if (match) {
       return parseInt(match[1], 10);
@@ -833,6 +939,7 @@ export async function pollForExit(
 
     const elapsed = Math.floor((Date.now() - start) / 1000);
     options.onTick?.(elapsed);
+    void lastReadError;
 
     await new Promise<void>((resolve, reject) => {
       if (signal.aborted) return reject(new Error("Aborted"));
