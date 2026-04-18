@@ -94,26 +94,37 @@ export function isSupatermAvailable(): boolean {
   return isSupatermRuntimeAvailable();
 }
 
-// ── Supaterm capture with retry ─────────────────────────────────────────
+// ── Supaterm sp CLI wrappers with retry ───────────────────────────────
 //
-// `sp pane capture` is a thin CLI over an IPC socket to the Supaterm app.
-// Under concurrent load (dozens of subagents polling simultaneously) it can
-// fail transiently with messages like:
-//   Command failed: sp pane capture <surface> --lines 5 --scope scrollback
+// Every call to the Supaterm `sp` binary is a thin CLI over an IPC socket
+// to the Supaterm app. Under concurrent load (dozens of subagents spawning
+// / polling simultaneously) it can fail transiently with messages like:
+//   Command failed: /Applications/supaterm.app/Contents/Resources/bin/sp \
+//     tab new --json
 //   Error: Failed to read a response from Supaterm.
+// or the same message for `pane capture` / `pane send` / `pane close`.
 //
-// These failures are NOT signals that the pane is dead — they're socket
-// races that clear up on the next tick. Without the retry below, a single
-// transient hiccup would bubble all the way up to index.ts's catch and
-// prematurely declare the entire subagent "failed", causing agent_group
-// runs to collapse en masse even when every subagent is still working.
+// These failures are NOT signals that Supaterm is unhealthy — they're
+// socket races that clear up on the next attempt. Without the retry below,
+// a single transient hiccup at spawn time (tab new) would kill the
+// subagent before it even started; at poll time (pane capture) it would
+// prematurely declare a still-running subagent "failed". Both made
+// agent_group runs collapse en masse.
+//
+// Strategy: every sp call goes through spExecSync / spExecAsync, which
+// retry a small number of times with linear backoff on known transient
+// error patterns. Non-transient errors fall through immediately so real
+// bugs still surface.
 
 const SUPATERM_TRANSIENT_PATTERNS = [
   /failed to read a response from supaterm/i,
+  /failed to send message to supaterm/i,
   /connection refused/i,
   /broken pipe/i,
   /eagain/i,
   /etimedout/i,
+  /socket hang up/i,
+  /no such file or directory.*\.sock/i,
 ];
 
 function isSupatermTransientError(err: unknown): boolean {
@@ -125,11 +136,18 @@ function isSupatermTransientError(err: unknown): boolean {
   return SUPATERM_TRANSIENT_PATTERNS.some((re) => re.test(message));
 }
 
-const SUPATERM_CAPTURE_ATTEMPTS = Number(
-  process.env.PI_SUBAGENT_SUPATERM_CAPTURE_ATTEMPTS ?? "3",
+// Attempts and backoff are shared across all sp commands. Kept the old
+// *_CAPTURE_* env names as aliases for backwards compat with anyone who
+// was already overriding them.
+const SUPATERM_ATTEMPTS = Number(
+  process.env.PI_SUBAGENT_SUPATERM_ATTEMPTS ??
+    process.env.PI_SUBAGENT_SUPATERM_CAPTURE_ATTEMPTS ??
+    "4",
 );
-const SUPATERM_CAPTURE_BACKOFF_MS = Number(
-  process.env.PI_SUBAGENT_SUPATERM_CAPTURE_BACKOFF_MS ?? "75",
+const SUPATERM_BACKOFF_MS = Number(
+  process.env.PI_SUBAGENT_SUPATERM_BACKOFF_MS ??
+    process.env.PI_SUBAGENT_SUPATERM_CAPTURE_BACKOFF_MS ??
+    "100",
 );
 
 function sleep(ms: number): Promise<void> {
@@ -137,51 +155,71 @@ function sleep(ms: number): Promise<void> {
 }
 
 function sleepSync(ms: number): void {
-  // Simple synchronous sleep via Atomics so sync readScreen() callers
-  // still get retry behavior without pulling in a new dep.
+  // Synchronous sleep via Atomics so sync sp callers still get retry
+  // behavior without pulling in a new dep. Node's main thread permits
+  // Atomics.wait (unlike browser main threads).
   const buffer = new SharedArrayBuffer(4);
   Atomics.wait(new Int32Array(buffer), 0, 0, ms);
 }
 
-function supatermCaptureSync(surface: string, lines: number): string {
+interface SpExecOptions {
+  input?: string;
+}
+
+function spExecSync(args: string[], opts: SpExecOptions = {}): string {
   let lastError: unknown;
-  for (let attempt = 1; attempt <= SUPATERM_CAPTURE_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= SUPATERM_ATTEMPTS; attempt++) {
     try {
-      return execFileSync(
-        spBin(),
-        ["pane", "capture", surface, "--lines", String(lines), "--scope", "scrollback"],
-        { encoding: "utf8" },
-      );
+      const out = execFileSync(spBin(), args, {
+        encoding: "utf8",
+        ...(opts.input !== undefined ? { input: opts.input } : {}),
+      });
+      return typeof out === "string" ? out : String(out);
     } catch (err) {
       lastError = err;
-      if (attempt >= SUPATERM_CAPTURE_ATTEMPTS || !isSupatermTransientError(err)) {
+      if (attempt >= SUPATERM_ATTEMPTS || !isSupatermTransientError(err)) {
         break;
       }
-      sleepSync(SUPATERM_CAPTURE_BACKOFF_MS * attempt);
+      sleepSync(SUPATERM_BACKOFF_MS * attempt);
     }
   }
   throw lastError;
 }
 
-async function supatermCaptureAsync(surface: string, lines: number): Promise<string> {
+async function spExecAsync(args: string[], opts: SpExecOptions = {}): Promise<string> {
   let lastError: unknown;
-  for (let attempt = 1; attempt <= SUPATERM_CAPTURE_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= SUPATERM_ATTEMPTS; attempt++) {
     try {
-      const { stdout } = await execFileAsync(
-        spBin(),
-        ["pane", "capture", surface, "--lines", String(lines), "--scope", "scrollback"],
-        { encoding: "utf8" },
-      );
-      return stdout;
+      const { stdout } = await execFileAsync(spBin(), args, {
+        encoding: "utf8",
+        ...(opts.input !== undefined ? { input: opts.input } : {}),
+      });
+      return typeof stdout === "string" ? stdout : String(stdout);
     } catch (err) {
       lastError = err;
-      if (attempt >= SUPATERM_CAPTURE_ATTEMPTS || !isSupatermTransientError(err)) {
+      if (attempt >= SUPATERM_ATTEMPTS || !isSupatermTransientError(err)) {
         break;
       }
-      await sleep(SUPATERM_CAPTURE_BACKOFF_MS * attempt);
+      await sleep(SUPATERM_BACKOFF_MS * attempt);
     }
   }
   throw lastError;
+}
+
+function supatermCaptureSync(surface: string, lines: number): string {
+  return spExecSync([
+    "pane", "capture", surface,
+    "--lines", String(lines),
+    "--scope", "scrollback",
+  ]);
+}
+
+async function supatermCaptureAsync(surface: string, lines: number): Promise<string> {
+  return spExecAsync([
+    "pane", "capture", surface,
+    "--lines", String(lines),
+    "--scope", "scrollback",
+  ]);
 }
 
 // ── cmux detection ──────────────────────────────────────────────────────
@@ -473,12 +511,10 @@ export function createSurface(name: string, options?: { focus?: boolean }): stri
   if (backend === "supaterm") {
     const args = ["tab", "new", "--json"];
     if (shouldFocus) args.push("--focus");
-    const result: SpCreateResult = JSON.parse(
-      execFileSync(spBin(), args, { encoding: "utf8" }).trim()
-    );
+    const result: SpCreateResult = JSON.parse(spExecSync(args).trim());
     const surface = spPaneSelector(result);
     try {
-      execFileSync(spBin(), ["tab", "rename", name, spTabSelector(result)], { encoding: "utf8" });
+      spExecSync(["tab", "rename", name, spTabSelector(result)]);
     } catch { /* optional */ }
     return surface;
   }
@@ -529,12 +565,10 @@ export function createSurfaceSplit(
     if (!shouldFocus) args.push("--no-focus");
     if (fromSurface) args.push("--in", fromSurface);
     args.push("--json");
-    const result: SpCreateResult = JSON.parse(
-      execFileSync(spBin(), args, { encoding: "utf8" }).trim()
-    );
+    const result: SpCreateResult = JSON.parse(spExecSync(args).trim());
     const surface = spPaneSelector(result);
     try {
-      execFileSync(spBin(), ["tab", "rename", name, spTabSelector(result)], { encoding: "utf8" });
+      spExecSync(["tab", "rename", name, spTabSelector(result)]);
     } catch { /* optional */ }
     return surface;
   }
@@ -626,7 +660,7 @@ export function renameCurrentTab(title: string): void {
 
   if (backend === "supaterm") {
     // Uses ambient SUPATERM_SURFACE_ID context to find the current tab.
-    execFileSync(spBin(), ["tab", "rename", title], { encoding: "utf8" });
+    spExecSync(["tab", "rename", title]);
     return;
   }
 
@@ -654,7 +688,7 @@ export function renameWorkspace(title: string): void {
 
   if (backend === "supaterm") {
     try {
-      execFileSync(spBin(), ["space", "rename", title], { encoding: "utf8" });
+      spExecSync(["space", "rename", title]);
     } catch {
       // Optional — may fail with a single space.
     }
@@ -748,10 +782,7 @@ export function sendCommand(surface: string, command: string): void {
 
   if (backend === "supaterm") {
     // Pipe command text via stdin (`-`) and use `--newline` to append Enter.
-    execFileSync(spBin(), ["pane", "send", "--newline", surface, "-"], {
-      encoding: "utf8",
-      input: command,
-    });
+    spExecSync(["pane", "send", "--newline", surface, "-"], { input: command });
     return;
   }
 
@@ -875,7 +906,7 @@ export function closeSurface(surface: string): void {
   }
 
   if (backend === "supaterm") {
-    execFileSync(spBin(), ["pane", "close", surface], { encoding: "utf8" });
+    spExecSync(["pane", "close", surface]);
     return;
   }
 
