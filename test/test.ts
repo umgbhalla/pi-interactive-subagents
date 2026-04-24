@@ -38,10 +38,7 @@ import {
   normalizeModelHint,
   resolveHintedModel,
 } from "../pi-extension/subagents/model-hints.ts";
-import {
-  buildSubagentTaskArtifactPath,
-  writeSubagentTaskArtifact,
-} from "../pi-extension/subagents/task-artifact.ts";
+import { buildSubagentToolArg } from "../pi-extension/subagents/tool-selection.ts";
 
 // --- Helpers ---
 
@@ -524,44 +521,6 @@ describe("model-hints.ts", () => {
   });
 });
 
-describe("task-artifact.ts", () => {
-  let dir: string;
-
-  before(() => {
-    dir = createTestDir();
-  });
-
-  after(() => {
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("builds sanitized markdown artifact paths", () => {
-    const path = buildSubagentTaskArtifactPath(
-      dir,
-      "Fork: provider-inventory",
-      new Date("2026-04-13T07:34:28.680Z"),
-    );
-    assert.equal(
-      path,
-      join(dir, "context/fork-provider-inventory-2026-04-13T07-34-28.md"),
-    );
-  });
-
-  it("writes task content to a file-backed prompt artifact", () => {
-    const path = writeSubagentTaskArtifact(
-      dir,
-      "Fork: provider-inventory",
-      "very long prompt",
-      new Date("2026-04-13T07:34:28.680Z"),
-    );
-    assert.equal(readFileSync(path, "utf8"), "very long prompt");
-    assert.equal(
-      path,
-      join(dir, "context/fork-provider-inventory-2026-04-13T07-34-28.md"),
-    );
-  });
-});
-
 describe("cmux.ts", () => {
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
@@ -691,5 +650,25 @@ describe("cmux.ts", () => {
 
       closeSurface(surface);
     });
+  });
+});
+
+describe("tool-selection.ts", () => {
+  it("preserves required lifecycle tools when explicit child tools are set", () => {
+    assert.equal(
+      buildSubagentToolArg("read, bash"),
+      "read,bash,write_artifact,read_artifact,subagent_done",
+    );
+  });
+
+  it("dedupes tools and ignores unknown entries", () => {
+    assert.equal(
+      buildSubagentToolArg("read, read, unknown, bash"),
+      "read,bash,write_artifact,read_artifact,subagent_done",
+    );
+  });
+
+  it("does not force a --tools override when none was requested", () => {
+    assert.equal(buildSubagentToolArg(undefined), undefined);
   });
 });

@@ -28,10 +28,13 @@ export interface MessageEntry extends SessionEntry {
 }
 
 const OMIT_FORK_TOOL_RESULTS = new Set([
+  "mapreduce",
+  // Legacy names kept for backward-compat when forking pre-existing sessions.
   "active_subagents",
   "subagent",
   "agent_group",
   "subagents_list",
+  "branch",
 ]);
 const MAX_FORK_TOOL_RESULT_LINES = 16;
 const MAX_FORK_TOOL_RESULT_CHARS = 1200;

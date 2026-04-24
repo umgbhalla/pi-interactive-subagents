@@ -1,14 +1,19 @@
 /**
- * Extension loaded into sub-agents.
- * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
- * - Provides a `subagent_done` tool for autonomous agents to self-terminate
- * - Enforces that autonomous subagents call write_artifact and subagent_done
- *   before their session can end. On agent_end, if these haven't been called,
- *   a follow-up turn is injected automatically — no idle polling, no nudges.
+ * Extension loaded into sub-agents (child pi processes spawned by mapreduce).
+ *
+ * Responsibilities:
+ *  - Render a small widget above the editor showing agent identity + tool set
+ *    (toggle with Ctrl+J).
+ *  - Register `subagent_done` for the child to signal completion. Calling it
+ *    *hard-exits* the child process so the agent loop cannot take another turn
+ *    and cannot respond to the tool result.
+ *  - If the child ends a turn without calling `subagent_done`, inject a
+ *    follow-up user message reminding it to. Gives up after MAX_ENFORCEMENT.
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
+import * as lineage from "./lineage.ts";
 
 export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
@@ -18,6 +23,7 @@ export default function (pi: ExtensionAPI) {
   // Read subagent identity from env vars (set by parent orchestrator)
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
+  const lineageId = process.env.PI_SUBAGENT_LINEAGE_ID || undefined;
 
   // ── Completion enforcement state ──
   let hasCalledWriteArtifact = false;
@@ -26,7 +32,7 @@ export default function (pi: ExtensionAPI) {
   let enforcementCount = 0;
   const MAX_ENFORCEMENT = 3;
 
-  function renderWidget(ctx: { ui: { setWidget: Function } }, theme: any) {
+  function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
     ctx.ui.setWidget(
       "subagent-tools",
       (_tui: any, theme: any) => {
@@ -38,7 +44,6 @@ export default function (pi: ExtensionAPI) {
           : "";
 
         if (expanded) {
-          // Expanded: full tool list + denied
           const countInfo = theme.fg("dim", ` — ${toolNames.length} available`);
           const hint = theme.fg("muted", "  (Ctrl+J to collapse)");
 
@@ -61,7 +66,6 @@ export default function (pi: ExtensionAPI) {
           );
           box.addChild(content);
         } else {
-          // Collapsed: one-line summary
           const countInfo = theme.fg("dim", ` — ${toolNames.length} tools`);
           const deniedInfo = denied.length > 0
             ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} denied`)
@@ -78,7 +82,6 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
@@ -87,8 +90,6 @@ export default function (pi: ExtensionAPI) {
       .map((s) => s.trim())
       .filter(Boolean);
 
-    // Detect autonomous subagent: has PI_SUBAGENT_AGENT set (spawned by parent)
-    // and NOT interactive (no PI_SUBAGENT_INTERACTIVE or explicitly "0")
     const isSubagent = !!(process.env.PI_SUBAGENT_NAME || process.env.PI_SUBAGENT_AGENT);
     const interactiveFlag = process.env.PI_SUBAGENT_INTERACTIVE;
     isAutonomous = isSubagent && interactiveFlag !== "1";
@@ -100,31 +101,23 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx, null);
   });
 
-  // Track tool calls
   pi.on("tool_execution_end", async (event, _ctx) => {
-    if (event.toolName === "write_artifact") {
-      hasCalledWriteArtifact = true;
-    }
-    if (event.toolName === "subagent_done") {
-      hasCalledSubagentDone = true;
-    }
+    if (event.toolName === "write_artifact") hasCalledWriteArtifact = true;
+    if (event.toolName === "subagent_done") hasCalledSubagentDone = true;
   });
 
-  // ── Completion enforcement ──
-  // When the agent finishes a turn (agent_end = model stopped generating),
-  // check if it called write_artifact + subagent_done. If not, inject a
-  // follow-up turn that forces it to complete properly.
+  // If the model stops its turn without calling subagent_done, nudge it.
+  // Once subagent_done runs, the process exits before this ever fires.
   pi.on("agent_end", async (_event, _ctx) => {
     if (!isAutonomous) return;
-    if (hasCalledSubagentDone) return; // already done
-    if (enforcementCount >= MAX_ENFORCEMENT) return; // give up after N tries
+    if (hasCalledSubagentDone) return;
+    if (enforcementCount >= MAX_ENFORCEMENT) return;
 
     enforcementCount++;
 
     const missing: string[] = [];
     if (!hasCalledWriteArtifact) missing.push("`write_artifact` with your findings/results");
     if (!hasCalledSubagentDone) missing.push("`subagent_done` to close this session");
-
     if (missing.length === 0) return;
 
     const msg = [
@@ -140,7 +133,6 @@ export default function (pi: ExtensionAPI) {
     pi.sendUserMessage(msg, { deliverAs: "followUp" });
   });
 
-  // Toggle expand/collapse with Ctrl+J
   pi.registerShortcut("ctrl+j", {
     description: "Toggle subagent tools widget",
     handler: (ctx) => {
@@ -154,16 +146,19 @@ export default function (pi: ExtensionAPI) {
     label: "Subagent Done",
     description:
       "Call this tool when you have completed your task. " +
-      "It will close this session and return your results to the main session. " +
+      "It closes this subagent session immediately — the agent loop will NOT take another turn after this call. " +
       "Your LAST assistant message before calling this becomes the summary returned to the caller.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       hasCalledSubagentDone = true;
-      ctx.shutdown();
-      return {
-        content: [{ type: "text", text: "Shutting down subagent session." }],
-        details: {},
-      };
+
+      // Mark lineage row finished so the parent's view of the tree stays honest.
+      try { lineage.markFinished(lineageId); } catch { /* best-effort */ }
+
+      // Flush session state, then hard-exit. `process.exit(0)` returns `never`
+      // so the agent loop never sees a tool result and cannot continue.
+      try { ctx.shutdown(); } catch { /* best-effort */ }
+      process.exit(0);
     },
   });
 }
