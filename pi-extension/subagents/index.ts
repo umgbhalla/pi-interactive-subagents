@@ -42,6 +42,7 @@ import {
 import { resolveHintedModel, type ModelHint } from "./model-hints.ts";
 import { buildSubagentToolArg } from "./tool-selection.ts";
 import * as lineage from "./lineage.ts";
+import { runMapReduce, type OrchestratorTrackInput } from "./orchestrate.ts";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Constants & types
@@ -324,19 +325,32 @@ function startWidgetRefresh() {
 // Launch & watch a single fork
 // ────────────────────────────────────────────────────────────────────────────
 
+interface LaunchCtx {
+  sessionManager: { getSessionFile(): string | null | undefined; getSessionId(): string };
+  cwd: string;
+  model?: { provider: string; modelId: string } | null;
+}
+
 async function launchSubagent(
   spec: LaunchSpec,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string }; cwd: string },
+  ctx: LaunchCtx,
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = spec.agent ? loadAgentDefaults(spec.agent) : null;
-  const { model: effectiveModel, modelHint: effectiveModelHint } = resolveHintedModel({
+  let { model: effectiveModel, modelHint: effectiveModelHint } = resolveHintedModel({
     explicitModel: spec.model,
     modelHint: spec.modelHint,
     agentDefaults: agentDefs,
   });
+  // Fall back to the parent's currently active model when nothing else was
+  // specified. writeSanitizedForkSession drops `model_change` entries from
+  // the forked session, so without this fallback the child boots from its
+  // config default and silently runs on the wrong model.
+  if (!effectiveModel && ctx.model?.provider && ctx.model?.modelId) {
+    effectiveModel = `${ctx.model.provider}/${ctx.model.modelId}`;
+  }
   const effectiveTools = spec.tools ?? agentDefs?.tools;
   const effectiveSkills = spec.skills ?? agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
@@ -643,56 +657,47 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       const trackCount = params.tracks.length;
-      const started: RunningSubagent[] = [];
+      const orchTracks: OrchestratorTrackInput[] = params.tracks.map((t) => ({
+        name: t.name,
+        prompt: t.prompt,
+        depth: t.depth,
+      }));
 
-      for (let i = 0; i < trackCount; i++) {
-        const track = params.tracks[i];
-        const effectiveDepth = clampDepth(track.depth, liveRemaining);
-
-        const forkPrompt = buildTrackPrompt(track, i, params.tracks);
-        const running = await launchSubagent(
-          {
-            name: `Fork: ${track.name}`,
-            task: forkPrompt,
-            effectiveDepth,
-            model: params.model,
-            modelHint: params.modelHint,
-          },
-          ctx,
-        );
-        const watcherAbort = new AbortController();
-        running.abortController = watcherAbort;
-        if (signal) signal.addEventListener("abort", () => watcherAbort.abort(), { once: true });
-        started.push(running);
-      }
-
-      startWidgetRefresh();
-
-      const resultsByIndex: Array<SubagentResult | undefined> = new Array(trackCount);
-      let done = 0;
-
-      const watchTasks = started.map((running, index) =>
-        watchSubagent(running, running.abortController!.signal).then((result) => {
-          resultsByIndex[index] = result;
-          done += 1;
+      const results = await runMapReduce<RunningSubagent>(orchTracks, signal ?? undefined, {
+        async launch(track) {
+          const effectiveDepth = clampDepth(track.depth, liveRemaining);
+          const forkPrompt = buildTrackPrompt(
+            { name: track.name, prompt: track.prompt, depth: track.depth },
+            orchTracks.indexOf(track),
+            orchTracks,
+          );
+          return launchSubagent(
+            {
+              name: `Fork: ${track.name}`,
+              task: forkPrompt,
+              effectiveDepth,
+              model: params.model,
+              modelHint: params.modelHint,
+            },
+            ctx,
+          );
+        },
+        watch(running, watchSignal) {
+          return watchSubagent(running, watchSignal);
+        },
+        onLaunchPhaseDone: () => startWidgetRefresh(),
+        onProgress: ({ done, total, results: partial }) => {
           updateWidget();
-          const remaining = trackCount - done;
+          const remaining = total - done;
           onUpdate?.({
             content: [{
               type: "text",
-              text: `mapreduce: ${done}/${trackCount} tracks done${remaining > 0 ? `, ${remaining} running…` : ", all complete."}`,
+              text: `mapreduce: ${done}/${total} tracks done${remaining > 0 ? `, ${remaining} running…` : ", all complete."}`,
             }],
-            details: {
-              done,
-              total: trackCount,
-              results: resultsByIndex.filter((r): r is SubagentResult => !!r),
-            },
+            details: { done, total, results: partial },
           });
-          return result;
-        }),
-      );
-
-      const results = await Promise.all(watchTasks);
+        },
+      });
 
       const successCount = results.filter((r) => r.exitCode === 0).length;
       const maxElapsed = results.reduce((max, r) => Math.max(max, r.elapsed), 0);

@@ -39,6 +39,11 @@ import {
   resolveHintedModel,
 } from "../pi-extension/subagents/model-hints.ts";
 import { buildSubagentToolArg } from "../pi-extension/subagents/tool-selection.ts";
+import {
+  runMapReduce,
+  type OrchestratorRunningSubagent,
+  type OrchestratorSubagentResult,
+} from "../pi-extension/subagents/orchestrate.ts";
 
 // --- Helpers ---
 
@@ -670,5 +675,147 @@ describe("tool-selection.ts", () => {
 
   it("does not force a --tools override when none was requested", () => {
     assert.equal(buildSubagentToolArg(undefined), undefined);
+  });
+});
+
+describe("orchestrate.ts", () => {
+  type FakeRunning = OrchestratorRunningSubagent & { name: string };
+
+  function fakeOk(track: { name: string; prompt: string }): OrchestratorSubagentResult {
+    return {
+      name: track.name,
+      task: track.prompt,
+      summary: `ok ${track.name}`,
+      exitCode: 0,
+      elapsed: 1,
+    };
+  }
+
+  it("returns one result per track, in track order", async () => {
+    const tracks = [
+      { name: "a", prompt: "do a" },
+      { name: "b", prompt: "do b" },
+      { name: "c", prompt: "do c" },
+    ];
+    const results = await runMapReduce<FakeRunning>(tracks, undefined, {
+      async launch(track) {
+        return { name: track.name } as FakeRunning;
+      },
+      async watch(running) {
+        return fakeOk({ name: running.name, prompt: `do ${running.name}` });
+      },
+    });
+    assert.equal(results.length, 3);
+    assert.deepEqual(results.map((r) => r.name), ["a", "b", "c"]);
+    assert.equal(results.every((r) => r.exitCode === 0), true);
+  });
+
+  it("synthesizes a per-track failure when launch throws, and keeps siblings running", async () => {
+    const tracks = [
+      { name: "a", prompt: "do a" },
+      { name: "b-broken", prompt: "do b" },
+      { name: "c", prompt: "do c" },
+    ];
+    const watched: string[] = [];
+    const progress: Array<{ done: number; total: number }> = [];
+
+    const results = await runMapReduce<FakeRunning>(tracks, undefined, {
+      async launch(track) {
+        if (track.name === "b-broken") throw new Error("transient mux failure");
+        return { name: track.name } as FakeRunning;
+      },
+      async watch(running) {
+        watched.push(running.name);
+        return fakeOk({ name: running.name, prompt: `do ${running.name}` });
+      },
+      onProgress: ({ done, total }) => progress.push({ done, total }),
+    });
+
+    assert.equal(results.length, 3);
+    assert.deepEqual(results.map((r) => r.name), ["a", "b-broken", "c"]);
+    assert.equal(results[0].exitCode, 0);
+    assert.equal(results[1].exitCode, 1);
+    assert.match(results[1].summary, /transient mux failure/);
+    assert.equal(results[1].error, "transient mux failure");
+    assert.equal(results[2].exitCode, 0);
+
+    // Siblings of the failed launch were still watched.
+    assert.deepEqual(watched.sort(), ["a", "c"]);
+
+    // Progress fired for every track, terminal value is total/total.
+    assert.equal(progress.length, 3);
+    assert.deepEqual(progress.at(-1), { done: 3, total: 3 });
+  });
+
+  it("never throws even when every launch fails", async () => {
+    const tracks = [
+      { name: "x", prompt: "x" },
+      { name: "y", prompt: "y" },
+    ];
+    const results = await runMapReduce<FakeRunning>(tracks, undefined, {
+      async launch() {
+        throw new Error("backend down");
+      },
+      async watch() {
+        throw new Error("should never be called");
+      },
+    });
+    assert.equal(results.length, 2);
+    assert.equal(results.every((r) => r.exitCode === 1), true);
+    assert.equal(results.every((r) => /backend down/.test(r.summary)), true);
+  });
+
+  it("surfaces watcher errors as exit code 1 instead of throwing", async () => {
+    const tracks = [{ name: "a", prompt: "a" }];
+    const results = await runMapReduce<FakeRunning>(tracks, undefined, {
+      async launch(track) {
+        return { name: track.name } as FakeRunning;
+      },
+      async watch() {
+        throw new Error("pollForExit blew up");
+      },
+    });
+    assert.equal(results.length, 1);
+    assert.equal(results[0].exitCode, 1);
+    assert.match(results[0].summary, /Watcher error: pollForExit blew up/);
+  });
+
+  it("propagates parent abort to per-track abort controllers", async () => {
+    const tracks = [
+      { name: "a", prompt: "a" },
+      { name: "b", prompt: "b" },
+    ];
+    const parent = new AbortController();
+    const seenAborts: string[] = [];
+
+    const promise = runMapReduce<FakeRunning>(tracks, parent.signal, {
+      async launch(track) {
+        return { name: track.name } as FakeRunning;
+      },
+      async watch(running, signal) {
+        return new Promise<OrchestratorSubagentResult>((resolve) => {
+          signal.addEventListener("abort", () => {
+            seenAborts.push(running.name);
+            resolve({
+              name: running.name,
+              task: running.name,
+              summary: "cancelled",
+              exitCode: 1,
+              elapsed: 0,
+              error: "cancelled",
+            });
+          });
+        });
+      },
+    });
+
+    // Give launch loop a tick to run, then abort the parent.
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    parent.abort();
+    const results = await promise;
+
+    assert.equal(results.length, 2);
+    assert.deepEqual(seenAborts.sort(), ["a", "b"]);
+    assert.equal(results.every((r) => r.exitCode === 1), true);
   });
 });
