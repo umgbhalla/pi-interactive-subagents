@@ -39,7 +39,7 @@ import {
   findLastAssistantMessage,
   writeSanitizedForkSession,
 } from "./session.ts";
-import { resolveHintedModel, type ModelHint } from "./model-hints.ts";
+import { normalizeModelHint, resolveHintedModel, type ModelHint } from "./model-hints.ts";
 import { buildSubagentToolArg } from "./tool-selection.ts";
 import * as lineage from "./lineage.ts";
 import { runMapReduce, type OrchestratorTrackInput } from "./orchestrate.ts";
@@ -71,16 +71,17 @@ const MapReduceParams = Type.Object({
     description: "Parallel forks to run. A single track is a context-preserving iterate.",
   }),
   model: Type.Optional(Type.String({ description: "Model override for all forks." })),
-  modelHint: Type.Optional(Type.Union([
-    Type.Literal("frontend"),
-    Type.Literal("non-frontend"),
-  ], { description: "Model family hint for all forks. Ignored when model is explicit." })),
+  modelHint: Type.Optional(Type.String({
+    description: "Model family hint for all forks. Allowed values: 'frontend', 'non-frontend', 'fast', or 'reasoning'. Common aliases are accepted; invalid values are reported and ignored.",
+  })),
 });
 
 interface AgentDefaults {
   model?: string;
   frontendModel?: string;
   nonFrontendModel?: string;
+  fastModel?: string;
+  reasoningModel?: string;
   tools?: string;
   skills?: string;
   thinking?: string;
@@ -172,6 +173,8 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
       model: get("model"),
       frontendModel: get("model-frontend") ?? get("frontend-model"),
       nonFrontendModel: get("model-non-frontend") ?? get("non-frontend-model") ?? get("model-backend") ?? get("backend-model"),
+      fastModel: get("model-fast") ?? get("fast-model"),
+      reasoningModel: get("model-reasoning") ?? get("reasoning-model") ?? get("model-deep") ?? get("deep-model"),
       tools: get("tools"),
       skills: get("skill") ?? get("skills"),
       thinking: get("thinking"),
@@ -657,6 +660,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       const trackCount = params.tracks.length;
+      const normalizedModelHint = normalizeModelHint(params.modelHint);
+      const invalidModelHint = params.modelHint && !normalizedModelHint ? params.modelHint : undefined;
       const orchTracks: OrchestratorTrackInput[] = params.tracks.map((t) => ({
         name: t.name,
         prompt: t.prompt,
@@ -677,7 +682,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               task: forkPrompt,
               effectiveDepth,
               model: params.model,
-              modelHint: params.modelHint,
+              modelHint: normalizedModelHint,
             },
             ctx,
           );
@@ -712,7 +717,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       });
 
       const header = `mapreduce completed: ${successCount}/${trackCount} succeeded. Wall time: ${formatElapsed(maxElapsed)}.${compatModeNote()}`;
-      const combined = `${header}\n\n${sections.join("\n\n---\n\n")}`;
+      const warning = invalidModelHint
+        ? `Warning: modelHint ${JSON.stringify(invalidModelHint)} is invalid; ignored. Allowed values: "frontend", "non-frontend", "fast", "reasoning".`
+        : "";
+      const combined = `${header}${warning ? `\n${warning}` : ""}\n\n${sections.join("\n\n---\n\n")}`;
 
       return {
         content: [{ type: "text", text: combined }],
@@ -722,6 +730,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           completed: successCount,
           failed: trackCount - successCount,
           elapsed: maxElapsed,
+          invalidModelHint,
           results: results.map((r, i) => ({
             name: params.tracks[i].name,
             task: params.tracks[i].prompt,

@@ -438,16 +438,30 @@ describe("model-hints.ts", () => {
       assert.equal(normalizeModelHint("frontend"), "frontend");
       assert.equal(normalizeModelHint("UI"), "frontend");
       assert.equal(normalizeModelHint("design"), "frontend");
+      assert.equal(normalizeModelHint("mobile"), "frontend");
     });
 
     it("normalizes non-frontend aliases", () => {
       assert.equal(normalizeModelHint("non-frontend"), "non-frontend");
       assert.equal(normalizeModelHint("backend"), "non-frontend");
       assert.equal(normalizeModelHint("coding"), "non-frontend");
+      assert.equal(normalizeModelHint("api"), "non-frontend");
+    });
+
+    it("normalizes fast aliases", () => {
+      assert.equal(normalizeModelHint("fast"), "fast");
+      assert.equal(normalizeModelHint("quick"), "fast");
+      assert.equal(normalizeModelHint("mini"), "fast");
+    });
+
+    it("normalizes reasoning aliases", () => {
+      assert.equal(normalizeModelHint("reasoning"), "reasoning");
+      assert.equal(normalizeModelHint("deep"), "reasoning");
+      assert.equal(normalizeModelHint("smart"), "reasoning");
     });
 
     it("returns undefined for unknown hints", () => {
-      assert.equal(normalizeModelHint("mobile"), undefined);
+      assert.equal(normalizeModelHint("banana"), undefined);
     });
   });
 
@@ -470,6 +484,28 @@ describe("model-hints.ts", () => {
       );
       assert.equal(
         modelMatchesHintFamily("anthropic/claude-opus-4-7", "non-frontend"),
+        false,
+      );
+    });
+
+    it("matches small models for fast work", () => {
+      assert.equal(
+        modelMatchesHintFamily("openai-codex/gpt-5.4-mini", "fast"),
+        true,
+      );
+      assert.equal(
+        modelMatchesHintFamily("anthropic/claude-sonnet-4-7", "fast"),
+        false,
+      );
+    });
+
+    it("matches strongest models for reasoning work", () => {
+      assert.equal(
+        modelMatchesHintFamily("openai-codex/gpt-5.5", "reasoning"),
+        true,
+      );
+      assert.equal(
+        modelMatchesHintFamily("anthropic/claude-haiku-4-5", "reasoning"),
         false,
       );
     });
@@ -519,8 +555,19 @@ describe("model-hints.ts", () => {
         agentDefaults: { model: "anthropic/claude-opus-4-7" },
       });
       assert.deepEqual(resolved, {
-        model: "openai-codex/gpt-5.4",
+        model: "openai-codex/gpt-5.5",
         modelHint: "non-frontend",
+      });
+    });
+
+    it("falls back to package defaults for fast and reasoning hints", () => {
+      assert.deepEqual(resolveHintedModel({ modelHint: "fast" }), {
+        model: "openai-codex/gpt-5.4-mini",
+        modelHint: "fast",
+      });
+      assert.deepEqual(resolveHintedModel({ modelHint: "smart" }), {
+        model: "openai-codex/gpt-5.5",
+        modelHint: "reasoning",
       });
     });
   });

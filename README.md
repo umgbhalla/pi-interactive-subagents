@@ -1,33 +1,23 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono) — spawn, orchestrate, and manage sub-agent sessions in multiplexer panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
+Map-reduced session forking for [pi](https://github.com/badlogic/pi-mono). A main pi session can fork itself into 1..8 parallel tracks, wait for all tracks to finish, and receive one combined result.
 
 https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f
 
 ## Table of Contents
 
 - [Overview](#overview)
-- [How It Works](#how-it-works)
+- [How mapreduce works](#how-mapreduce-works)
 - [Architecture](#architecture)
 - [Install](#install)
-- [What's Included](#whats-included)
-  - [Extensions](#extensions)
-  - [Bundled Agents](#bundled-agents)
-- [Async Subagent Lifecycle](#async-subagent-lifecycle)
-- [Spawning Subagents](#spawning-subagents)
-  - [Parameters](#parameters)
-  - [Orchestrator Control Tools](#orchestrator-control-tools)
-- [The `/plan` Workflow](#the-plan-workflow)
-- [The `/iterate` Workflow](#the-iterate-workflow)
-- [Session Forking & Context Propagation](#session-forking--context-propagation)
-- [Model Hints](#model-hints)
-- [Custom Agents](#custom-agents)
-  - [Frontmatter Reference](#frontmatter-reference)
-- [Tool Access Control](#tool-access-control)
-- [Role Folders](#role-folders)
-- [Session Artifacts](#session-artifacts)
-- [Multiplexer Status Integration](#multiplexer-status-integration)
-- [Tools Widget](#tools-widget)
+- [Tool reference](#tool-reference)
+- [Depth and recursive fan-out](#depth-and-recursive-fan-out)
+- [Session forking and context propagation](#session-forking-and-context-propagation)
+- [Completion and result aggregation](#completion-and-result-aggregation)
+- [Model hints](#model-hints)
+- [Session artifacts](#session-artifacts)
+- [Status widgets and mux integration](#status-widgets-and-mux-integration)
+- [Legacy agent definitions](#legacy-agent-definitions)
 - [Testing](#testing)
 - [Requirements](#requirements)
 - [License](#license)
@@ -36,201 +26,114 @@ https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f
 
 ## Overview
 
-`pi-interactive-subagents` is a pi extension package that turns a single pi coding agent into a multi-agent orchestration system. It lets a main pi session spawn specialized sub-agent sessions — each running in its own terminal multiplexer pane — without blocking the user or the main agent.
+`pi-interactive-subagents` is now centered on a single orchestration primitive: `mapreduce`.
 
-The package solves several problems at once:
-
-- **Context isolation** — Subagents work in dedicated sessions, keeping the main session's context window clean.
-- **Parallel execution** — Multiple subagents run concurrently (scouting, researching, reviewing) while the user keeps chatting.
-- **Specialization** — Each agent has a defined role (scout, worker, planner, reviewer) with tailored prompts, tools, and models.
-- **Automatic result steering** — When a subagent finishes, its result is steered back into the main session as an async interrupt, triggering a new turn so the orchestrator can process it.
+The old model was "spawn subagents and let results steer back later." The current model is stricter and easier to reason about: fork the current session into named tracks, run them concurrently, block the caller until every track exits, then return the combined summaries in track order.
 
 ```
-╭─ Subagents ──────────────────────── 2 running ─╮
-│ 00:23  Scout: Auth (scout)    8 msgs (5.1KB)   │
-│ 00:45  Scout: DB (scout)     12 msgs (9.3KB)   │
-╰─────────────────────────────────────────────────╯
+   OLD ASYNC MODEL                  CURRENT MAPREDUCE MODEL
+   ───────────────                  ───────────────────────
+   start agents ─▶ return           call mapreduce ─▶ fork tracks
+   agent works  ─▶ steer later      tracks run      ─▶ wait together
+   main keeps chatting              reduce results  ─▶ one response
+   state arrives out-of-band        caller resumes  ─▶ integrated context
 ```
+
+The important shift: `mapreduce` is a structured fork/join operation, not a background notification system.
+
+Primary behavior:
+
+- **Context-preserving forks** — every track starts from a sanitized copy of the current session.
+- **Parallel tracks** — 1..8 child pi processes run in separate mux panes.
+- **Blocking reduce** — the tool call does not finish until every track has completed or failed.
+- **Ordered aggregation** — the result contains one section per input track, in input order.
+- **Controlled recursion** — per-track `depth` controls whether child tracks may call `mapreduce` again.
+- **Shared workspace warning** — tracks do not get isolated git branches or worktrees; they share the same repository checkout.
 
 ---
 
-## How It Works
+## How mapreduce works
 
-Call `agent_group()` (or `subagent()` from a nested agent) and it **returns immediately**. Each sub-agent launches as a full `pi` process in its own multiplexer pane. A live widget above the input shows all running agents with elapsed time and progress. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the orchestrator can process it.
+At call time, `mapreduce` takes named tracks. Each track receives the full prior conversation plus its own prompt.
 
 ```typescript
-agent_group({
-  name: "Scouting",
-  agents: [
-    { name: "Scout: Auth", agent: "scout", task: "Analyze auth module" },
-    { name: "Scout: DB", agent: "scout", task: "Map database schema" },
+mapreduce({
+  tracks: [
+    {
+      name: "auth scout",
+      prompt: "Map the auth flow and identify risky files. Do not edit.",
+    },
+    {
+      name: "test scout",
+      prompt: "Find the fastest relevant tests for this change. Do not edit.",
+    },
+    {
+      name: "reviewer",
+      prompt: "Review the current diff for correctness issues. Do not edit.",
+    },
   ],
+  modelHint: "reasoning",
 })
-// Returns immediately → widget tracks progress → one grouped result when both finish
 ```
 
-Key behaviors:
+The operation is a fork/join pipeline:
 
-- **Non-blocking** — The main session stays fully interactive while subagents run.
-- **Fire-and-forget** — Launch and wait; results steer back automatically.
-- **Grouped results** — `agent_group` waits for all agents in the batch, then delivers one combined result.
-- **Completion enforcement** — Autonomous subagents are required to call `write_artifact` and `subagent_done` before exiting. If they forget, the system auto-injects follow-up prompts (up to 3 retries).
+```
+   parent session ──▶ sanitize fork ──▶ launch panes ──▶ watch exits ──▶ reduce summaries
+                            │                │               │                 │
+                            ▼                ▼               ▼                 ▼
+                     child JSONL       pi child procs    sentinels       combined result
+```
+
+One tool call owns the whole fan-out and fan-in.
+
+Inside the terminal, running tracks appear in a live widget:
+
+```
+╭─ mapreduce ───────────────────────────── 3 running ─╮
+│ 00:23  Fork: auth scout                      8 msgs │
+│ 00:45  Fork: test scout                    12 msgs  │
+│ 00:12  Fork: reviewer                     starting… │
+╰─────────────────────────────────────────────────────╯
+```
+
+Progress updates are streamed while the tool is running, then a final combined result is returned.
 
 ---
 
 ## Architecture
 
-The system is composed of three pi extensions, five bundled agent definitions, and a multiplexer abstraction layer that supports Supaterm, cmux, and zellij.
+The package registers three pi extensions:
 
-```mermaid
-flowchart TB
-    subgraph Main["Main Pi Session"]
-        User([User])
-        Orchestrator["Orchestrator Agent"]
-        Widget["Live Status Widget<br/><i>above editor, refreshes every 1s</i>"]
-        AgentGroup["agent_group / subagent tool"]
-        ArtifactStore["Session Artifacts<br/><i>~/.pi/history/&lt;project&gt;/artifacts/&lt;session-id&gt;/</i>"]
-    end
-
-    subgraph MuxLayer["Multiplexer Abstraction (cmux.ts)"]
-        MuxDetect{"Detect Backend<br/>Supaterm → cmux → zellij"}
-        CreateSurface["createSurface()<br/><i>New tab/pane</i>"]
-        SendCmd["sendCommand()<br/><i>Pipe pi command</i>"]
-        PollExit["pollForExit()<br/><i>Watch for sentinel</i>"]
-        ReadScreen["readScreen()<br/><i>Capture terminal output</i>"]
-    end
-
-    subgraph Sub1["Subagent Pane 1"]
-        PiProc1["pi process<br/><i>--session &lt;deterministic-path&gt;</i>"]
-        SubDone1["subagent-done.ts extension<br/><i>Tools widget + completion enforcement</i>"]
-        Agent1["Agent Role<br/><i>e.g. scout, worker, reviewer</i>"]
-    end
-
-    subgraph Sub2["Subagent Pane 2"]
-        PiProc2["pi process"]
-        SubDone2["subagent-done.ts extension"]
-        Agent2["Agent Role"]
-    end
-
-    subgraph AgentDefs["Agent Definitions (priority order)"]
-        ProjectAgents[".pi/agents/*.md<br/><i>Project-local</i>"]
-        GlobalAgents["~/.pi/agent/agents/*.md<br/><i>User global</i>"]
-        BundledAgents["Package agents/*.md<br/><i>Bundled defaults</i>"]
-    end
-
-    User -->|"task / /plan / /iterate"| Orchestrator
-    Orchestrator --> AgentGroup
-    AgentGroup --> MuxDetect
-    MuxDetect --> CreateSurface
-    CreateSurface --> SendCmd
-
-    SendCmd -->|"launches pi"| PiProc1
-    SendCmd -->|"launches pi"| PiProc2
-
-    PiProc1 --> SubDone1
-    SubDone1 --> Agent1
-    PiProc2 --> SubDone2
-    SubDone2 --> Agent2
-
-    Agent1 -->|"write_artifact"| ArtifactStore
-    Agent2 -->|"write_artifact"| ArtifactStore
-
-    PollExit -->|"reads sentinel:<br/>__SUBAGENT_DONE_N__"| Sub1
-    PollExit -->|"reads sentinel"| Sub2
-
-    PollExit -->|"result + session summary"| Orchestrator
-    Orchestrator -->|"updates"| Widget
-
-    AgentGroup -.->|"loads defaults"| AgentDefs
-
-    ReadScreen -.->|"active_subagents"| Sub1
-    ReadScreen -.->|"active_subagents"| Sub2
-
-    style Main fill:#1a1a2e,stroke:#4da6ff,color:#fff
-    style MuxLayer fill:#16213e,stroke:#f59e0b,color:#fff
-    style Sub1 fill:#0f3460,stroke:#22c55e,color:#fff
-    style Sub2 fill:#0f3460,stroke:#22c55e,color:#fff
-    style AgentDefs fill:#1a1a2e,stroke:#8b5cf6,color:#fff
-```
-
-### Component Breakdown
-
-| Component | File | Purpose |
+| Extension | File | Purpose |
 |-----------|------|---------|
-| **Subagents extension** | `pi-extension/subagents/index.ts` | Core orchestration — registers tools (`agent_group`, `subagent`, `active_subagents`, `subagents_list`, `branch`), commands (`/plan`, `/iterate`, `/subagent`), and message renderers for result display |
-| **Multiplexer layer** | `pi-extension/subagents/cmux.ts` | Backend abstraction — detects Supaterm/cmux/zellij, creates surfaces (tabs/panes), sends commands, reads screen output, polls for exit sentinels |
-| **Session utilities** | `pi-extension/subagents/session.ts` | JSONL session file manipulation — fork sanitization, entry reading, branch summaries, session merging |
-| **Model hints** | `pi-extension/subagents/model-hints.ts` | Resolves `modelHint: "frontend" \| "non-frontend"` to concrete model IDs based on agent defaults and package fallbacks |
-| **Subagent-done extension** | `pi-extension/subagents/subagent-done.ts` | Loaded into every subagent — provides the `subagent_done` tool, renders a tools widget (Ctrl+J), enforces completion (auto-nudges agents that forget to call `write_artifact` + `subagent_done`) |
-| **Session artifacts** | `pi-extension/session-artifacts/index.ts` | `write_artifact` / `read_artifact` tools for session-scoped file storage |
-| **cmux status** | `pi-extension/cmux-status/index.ts` | Pushes pi state (model, cost, tokens, idle/working) into the cmux sidebar — no-op when not in cmux |
-| **Plan skill** | `pi-extension/subagents/plan-skill.md` | Multi-phase planning workflow (investigate → plan → execute → review) loaded by the `/plan` command |
+| Subagents | `pi-extension/subagents/index.ts` | Registers `mapreduce`, launches child sessions, watches exits, aggregates results, enforces depth. |
+| Session artifacts | `pi-extension/session-artifacts/index.ts` | Provides `write_artifact` and `read_artifact` for session-scoped notes and reports. |
+| cmux status | `pi-extension/cmux-status/index.ts` | Pushes pi status into cmux when cmux is active. |
 
-### Subagent Lifecycle (Detailed)
+The core system is layered like this:
 
-```mermaid
-sequenceDiagram
-    participant User
-    participant Main as Main Session (Orchestrator)
-    participant Mux as Multiplexer Layer
-    participant Sub as Subagent (pi process)
-    participant FS as Session File (.jsonl)
-
-    User->>Main: "Analyze the auth module"
-    Main->>Main: agent_group({ agents: [...] })
-
-    Note over Main: For each agent in the group:
-    Main->>Main: loadAgentDefaults(agentName)
-    Main->>Main: resolveHintedModel()
-    Main->>Main: Generate deterministic session file path
-    Main->>Main: Write task to artifact file (@file)
-
-    Main->>Mux: createSurface(name)
-    Mux-->>Main: surface ID (e.g. "1/2/1")
-    Main->>Mux: sendCommand(surface, "pi --session <path> -e subagent-done.ts ...")
-
-    Mux->>Sub: Shell launches pi process
-
-    Note over Main: Tool returns immediately:<br/>"Agent group launched"
-
-    Main-->>User: "Launched 2 subagents. Results will return automatically."
-
-    par Background: Watcher polls for completion
-        loop Every 1 second
-            Main->>Mux: readScreenAsync(surface, 5)
-            Mux-->>Main: terminal output
-            Main->>Main: Check for __SUBAGENT_DONE_N__ sentinel
-            Main->>Main: Update widget (entries, bytes)
-        end
-    and Subagent works independently
-        Sub->>Sub: Receives task, works autonomously
-        Sub->>FS: Session entries written as JSONL
-        Sub->>Sub: write_artifact(findings)
-        Sub->>Sub: subagent_done() → ctx.shutdown()
-        Sub->>Mux: pi exits → shell echoes __SUBAGENT_DONE_0__
-    end
-
-    Main->>FS: Read session file, extract last assistant message
-    Main->>Mux: closeSurface()
-    Main->>Main: Remove from runningSubagents map
-
-    Note over Main: All agents in group done:
-    Main->>Main: sendAgentGroupResult() via pi.sendMessage()
-    Main-->>User: Grouped result rendered with colored background
+```
+   ┌ parent pi session ─────────────────────────────────────────┐
+   │ mapreduce tool                                             │
+   │ runMapReduce() launch/watch/reduce orchestrator            │
+   │ lineage ledger (~/.pi/subagents/lineage.db)                │
+   │ mux abstraction (Supaterm / cmux / zellij / screen)        │
+   │ child pi sessions + subagent_done lifecycle extension      │
+   └────────────────────────────────────────────────────────────┘
 ```
 
-### Result Steering Mechanism
+User-facing control stays at the top; process management and depth enforcement sit below it.
 
-When a subagent finishes, the result is delivered via `pi.sendMessage()` with `{ triggerTurn: true, deliverAs: "steer" }`. This:
+A single mapreduce call fans out through the mux layer and returns through the reducer:
 
-1. Injects the result as a new message into the main session's conversation
-2. Triggers a new model turn so the orchestrator agent can process the result
-3. Renders the result with a colored background box (green for success, red for failure)
-4. Makes it expandable with `Ctrl+O` to show the full summary and session file path
+```
+                         ┌──▶ track A pane ──▶ subagent_done ──┐
+   parent ──▶ mapreduce ─┼──▶ track B pane ──▶ subagent_done ──┼──▶ combined result
+                         └──▶ track C pane ──▶ subagent_done ──┘
+```
 
-### Exit Detection
-
-Subagents are launched with a trailing sentinel: `echo '__SUBAGENT_DONE_'$?'__'`. The watcher polls the terminal output every second using `readScreenAsync()`, looking for this pattern. When found, the exit code is extracted and the subagent is considered complete. This approach works across all multiplexer backends without requiring IPC.
+Every branch is independent while running; the parent only continues after the join.
 
 ---
 
@@ -240,500 +143,378 @@ Subagents are launched with a trailing sentinel: `echo '__SUBAGENT_DONE_'$?'__'`
 pi install git:github.com/HazAT/pi-interactive-subagents
 ```
 
-Supported multiplexers (in detection priority order):
-
-1. **[Supaterm](https://supaterm.com)** — via `sp` CLI (`SUPATERM_SOCKET_PATH`)
-2. **[cmux](https://github.com/manaflow-ai/cmux)** — via `cmux` CLI (`CMUX_SOCKET_PATH`)
-3. **[zellij](https://zellij.dev)** — via `zellij` CLI (`ZELLIJ` or `ZELLIJ_SESSION_NAME`)
-
-Start pi inside one of them:
+Start pi inside a supported multiplexer:
 
 ```bash
-cmux pi
-# or
+sp tab new pi          # Supaterm
+cmux pi               # cmux
 zellij --session pi   # then run: pi
 ```
 
-Override auto-detection with:
+Supported backends, in detection order:
+
+1. **Supaterm** — via the `sp` CLI (`SUPATERM_SOCKET_PATH`)
+2. **cmux** — via the `cmux` CLI (`CMUX_SOCKET_PATH`)
+3. **zellij** — via the `zellij` CLI (`ZELLIJ` or `ZELLIJ_SESSION_NAME`)
+4. **screen** — fallback PTY backend
+5. **compat** — last-resort child-process backend; useful for simple commands, not recommended for real pi child sessions
+
+Override backend detection with:
 
 ```bash
-export PI_SUBAGENT_MUX=cmux   # or supaterm, zellij
+export PI_SUBAGENT_MUX=supaterm   # or cmux, zellij, screen, compat
 ```
 
 ---
 
-## What's Included
+## Tool reference
 
-### Extensions
+### `mapreduce`
 
-The package registers three pi extensions:
-
-#### 1. Subagents — tools + commands
-
-| Tool | Level | Description |
-|------|-------|-------------|
-| `agent_group` | main | Spawn a batch of fresh sub-agents and collect one grouped result |
-| `subagent` | any | Spawn a single sub-agent in a dedicated terminal pane |
-| `active_subagents` | any | List currently running subagents, optionally with recent screen output |
-| `subagents_list` | any | List available agent definitions |
-| `branch` | main | Fork the current session into parallel tracks with full conversation context |
-
-| Command | Description |
-|---------|-------------|
-| `/plan <task>` | Start a full planning workflow (investigate → plan → execute → review) |
-| `/iterate [--agent <name>] <task>` | Fork into a subagent for focused work |
-| `/subagent <agent> [--hint frontend\|non-frontend] <task>` | Spawn a named agent directly |
-
-**Depth gating:** The main session exposes `agent_group` and `branch`; `subagent` is available everywhere. `agent_group` starts fresh sessions (no prior context), while `branch` carries forward the full conversation. Prefer `branch` when accumulated context is needed.
-
-#### 2. Session Artifacts — session-scoped file storage
-
-| Tool | Description |
-|------|-------------|
-| `write_artifact` | Write plans, context, notes to `~/.pi/history/<project>/artifacts/<session-id>/` |
-| `read_artifact` | Read artifacts from current or previous sessions (searches by name across all sessions) |
-
-#### 3. cmux Status — sidebar integration
-
-Pushes pi agent state into the cmux sidebar (no-op outside cmux):
-
-| Status Key | Content | When Updated |
-|------------|---------|--------------|
-| `pi_state` | Idle / Working | `session_start`, `agent_start`, `agent_end` |
-| `pi_model` | Short model name | `session_start`, `model_select` |
-| `pi_thinking` | Thinking level | `session_start`, `model_select` |
-| `pi_tokens` | Token count | `session_start`, `agent_end`, `turn_end` |
-| `pi_cost` | Session cost ($) | `session_start`, `agent_end`, `turn_end` |
-| `pi_tool` | Active tool name | `tool_execution_start`, `tool_execution_end` |
-
-### Bundled Agents
-
-| Agent | Model | Thinking | Role |
-|-------|-------|----------|------|
-| **scout** | Haiku 4.5 | — | Fast codebase reconnaissance — maps files, patterns, conventions. Read-only. |
-| **worker** | Sonnet 4.6 | minimal | Implements tasks from todos — writes code, runs tests, makes polished commits. |
-| **planner** | Opus 4.6 | medium | Interactive brainstorming — clarifies requirements, explores approaches, writes plans, creates todos. |
-| **reviewer** | Opus 4.6 | medium | Reviews code for bugs, security issues, correctness. Read-only. |
-| **visual-tester** | Sonnet 4.6 | — | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing. |
-
-Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled** (`agents/`). Override any bundled agent by placing your own version in the higher-priority location.
-
----
-
-## Async Subagent Lifecycle
-
-```
-1. Orchestrator calls agent_group()    → returns immediately ("started")
-2. For each agent:
-   a. Load agent defaults (model, tools, thinking, deny-tools)
-   b. Resolve model hints (frontend/non-frontend)
-   c. Generate deterministic session file path
-   d. Create multiplexer surface (tab/pane)
-   e. Build pi command with --session, -e subagent-done.ts, model, tools
-   f. Send command to surface
-3. Widget starts refreshing (every 1s)  → shows running agents + progress
-4. User keeps chatting                  → main session fully interactive
-5. Watcher polls each surface           → checks for __SUBAGENT_DONE_N__ sentinel
-6. Subagent finishes                    → result steered back as async interrupt
-7. Orchestrator processes result         → continues with new context
-```
-
-The live widget tracks all running agents:
-
-```
-╭─ Subagents ──────────────────────── 3 running ─╮
-│ 01:23  Scout: Auth (scout)      15 msgs (12KB) │
-│ 00:45  Researcher (researcher)   8 msgs (6KB)  │
-│ 00:12  Scout: DB (scout)             starting…  │
-╰─────────────────────────────────────────────────╯
-```
-
-Completion messages render with a colored background and are expandable with `Ctrl+O`.
-
----
-
-## Spawning Subagents
+Fork the current session into parallel tracks and return one combined result.
 
 ```typescript
-// Named agent with defaults from agent definition
-subagent({ name: "Scout", agent: "scout", task: "Analyze the codebase..." })
-
-// Batch launch with one grouped completion update
-agent_group({
-  name: "Implementation batch",
-  agents: [
-    { name: "Worker: API", agent: "worker", task: "Implement the API changes" },
-    { name: "Reviewer", agent: "reviewer", task: "Review the current diff" },
+mapreduce({
+  tracks: [
+    { name: "track label", prompt: "Track-specific task", depth: 0 },
   ],
+  model: "anthropic/claude-sonnet-4-7",
+  modelHint: "frontend",
 })
-
-// Fork — sub-agent gets full conversation context
-subagent({ name: "Iterate", fork: true, task: "Fix the bug where..." })
-
-// Typed fork — keep full conversation context but adopt a named agent role
-subagent({ name: "Debugger", agent: "debugger", fork: true, task: "Reproduce the flaky test" })
-
-// Override agent defaults
-subagent({ name: "Worker", agent: "worker", model: "anthropic/claude-opus-4-7", task: "Quick fix..." })
-
-// Hint the model family without hardcoding a specific model
-subagent({ name: "Worker", agent: "worker", modelHint: "frontend", task: "Polish the pricing page UI" })
-subagent({ name: "Worker", agent: "worker", modelHint: "non-frontend", task: "Refactor the queue worker" })
-
-// Custom working directory — picks up local .pi/ config, CLAUDE.md, etc.
-subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer", task: "..." })
 ```
-
-### Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `name` | string | required | Display name (shown in widget and pane title) |
-| `task` | string | required | Task prompt for the sub-agent |
-| `agent` | string | — | Load defaults from agent definition file |
-| `fork` | boolean | `false` | Copy current session for full context. When combined with `agent`, creates a typed fork: current context + named agent role |
-| `model` | string | — | Override agent's default model (e.g. `anthropic/claude-opus-4-7`) |
-| `modelHint` | `"frontend"` \| `"non-frontend"` | — | Hint the model family. `frontend` prefers Claude; `non-frontend` prefers Codex/GPT. Ignored when `model` is set |
-| `systemPrompt` | string | — | Append to system prompt |
-| `skills` | string | — | Comma-separated skill names to auto-load |
-| `tools` | string | — | Comma-separated native pi tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls` |
-| `cwd` | string | — | Working directory for the sub-agent (see [Role Folders](#role-folders)) |
+| `tracks` | array | required | 1..8 parallel forks to run. |
+| `tracks[].name` | string | required | Short label used in panes, widgets, and result headers. |
+| `tracks[].prompt` | string | required | Track-specific instruction. The track also inherits the parent conversation context. |
+| `tracks[].depth` | integer | `0` | How many more mapreduce levels this child may use. Clamped by the parent budget and hard-capped at 10. |
+| `model` | string | parent/default | Model override for all tracks. |
+| `modelHint` | `"frontend"` \| `"non-frontend"` \| `"fast"` \| `"reasoning"` | — | Model-family hint for all tracks. Ignored for selection when `model` is set, but still normalized in details. |
 
-### Orchestrator Control Tools
-
-These are for the **outer/orchestrator session** to supervise active work:
+Useful patterns:
 
 ```typescript
-// List running agents with optional screen capture
-active_subagents({ screenLines: 40 })
+// Reconnaissance fan-out: read-only tracks, no recursive spawning.
+mapreduce({
+  tracks: [
+    { name: "frontend", prompt: "Inspect the UI surface and report relevant files. Do not edit." },
+    { name: "backend", prompt: "Inspect API/data flow and report relevant files. Do not edit." },
+    { name: "tests", prompt: "Find relevant tests and verification commands. Do not edit." },
+  ],
+  modelHint: "fast",
+})
 
+// Implementation split: safe only when tracks touch partitioned files.
+mapreduce({
+  tracks: [
+    { name: "api", prompt: "Implement only the API changes in src/api/." },
+    { name: "ui", prompt: "Implement only the UI changes in src/app/." },
+  ],
+  modelHint: "frontend",
+})
+
+// Recursive research: each top-level track may fan out one more level.
+mapreduce({
+  tracks: [
+    { name: "security", prompt: "Audit auth/security. Split further only if useful.", depth: 1 },
+    { name: "performance", prompt: "Audit performance hotspots. Split further only if useful.", depth: 1 },
+  ],
+  modelHint: "reasoning",
+})
 ```
 
-Subagents with `spawning: false` have orchestration tools denied by default.
+### `write_artifact` and `read_artifact`
 
----
-
-## The `/plan` Workflow
-
-The `/plan` command orchestrates a full planning-to-implementation pipeline:
-
-```
-/plan Add a dark mode toggle to the settings page
-```
-
-```mermaid
-flowchart LR
-    A["🔍 Phase 1<br/>Investigation"] --> B["💬 Phase 2<br/>Planning<br/><i>(interactive subagent)</i>"]
-    B --> C["📋 Phase 3<br/>Review Plan"]
-    C --> D["🔨 Phase 4<br/>Execute Todos<br/><i>(scout + sequential workers)</i>"]
-    D --> E["🔎 Phase 5<br/>Code Review"]
-    E --> F["✅ Done"]
-
-    style A fill:#1e3a5f,stroke:#4da6ff,color:#fff
-    style B fill:#1e3a5f,stroke:#f59e0b,color:#fff
-    style C fill:#1e3a5f,stroke:#8b5cf6,color:#fff
-    style D fill:#1e3a5f,stroke:#22c55e,color:#fff
-    style E fill:#1e3a5f,stroke:#ef4444,color:#fff
-    style F fill:#1e3a5f,stroke:#22c55e,color:#fff
-```
-
-| Phase | What Happens | Tab Title |
-|-------|-------------|-----------|
-| 1. Investigation | Quick codebase scan (optionally spawns a scout) | `🔍 Investigating: dark mode` |
-| 2. Planning | Interactive planner subagent — user collaborates in the pane | `💬 Planning: dark mode` |
-| 3. Review Plan | Confirm todos, adjust if needed | `📋 Review: dark mode` |
-| 4. Execute | Scout gathers context, then workers implement todos **sequentially** | `🔨 Executing: 1/3` |
-| 5. Review | Reviewer subagent checks all changes, findings triaged by priority | `🔎 Reviewing` → `✅ Done` |
-
-Workers execute sequentially to avoid git conflicts. The planner phase is **interactive** — the user works directly with the planner subagent through the multiplexer pane.
-
----
-
-## The `/iterate` Workflow
-
-For quick, focused work without polluting the main session's context:
-
-```
-/iterate Fix the off-by-one error in the pagination logic
-/iterate --agent debugger Reproduce and fix the off-by-one error
-```
-
-This forks the current session into a subagent with full conversation context. Without `--agent`, it's a raw self-fork. With `--agent`, it creates a **typed fork**: the child keeps the full conversation but adopts that agent's role, model, tools, and constraints.
-
----
-
-## Session Forking & Context Propagation
-
-When `fork: true` is set, the system creates a sanitized copy of the parent session for the child:
-
-```mermaid
-flowchart LR
-    subgraph Parent["Parent Session (session.jsonl)"]
-        P1["session header"]
-        P2["user msg 1"]
-        P3["assistant msg 1<br/><i>(text + toolCalls)</i>"]
-        P4["toolResult<br/><i>(bash output)</i>"]
-        P5["assistant msg 2"]
-        P6["user msg: 'spawn subagent'"]
-    end
-
-    subgraph Sanitizer["writeSanitizedForkSession()"]
-        S1["Drop triggering user message"]
-        S2["Strip thinking blocks"]
-        S3["Truncate tool results<br/><i>(16 lines / 1200 chars)</i>"]
-        S4["Omit noisy tool outputs<br/><i>(active_subagents, etc.)</i>"]
-        S5["Preserve toolCall stubs<br/><i>(id + name only)</i>"]
-    end
-
-    subgraph Child["Fork Session"]
-        C1["session header"]
-        C2["user msg 1"]
-        C3["assistant msg 1<br/><i>(text + toolCall stubs)</i>"]
-        C4["toolResult<br/><i>(truncated)</i>"]
-        C5["assistant msg 2"]
-    end
-
-    Parent --> Sanitizer --> Child
-
-    style Parent fill:#1a1a2e,stroke:#4da6ff,color:#fff
-    style Sanitizer fill:#16213e,stroke:#f59e0b,color:#fff
-    style Child fill:#0f3460,stroke:#22c55e,color:#fff
-```
-
-The sanitizer (`session.ts:writeSanitizedForkSession`) ensures:
-
-- The triggering user message (e.g. "spawn a subagent") is dropped so the child doesn't see the meta-request
-- Assistant messages keep text blocks and toolCall **stubs** (id + name only, no arguments) — providers require every `tool_result` to match a `tool_use` in the preceding assistant message
-- Tool results from noisy tools (`active_subagents`, `subagent`, `agent_group`, etc.) are replaced with `[tool output omitted]`
-- Regular tool output is truncated to 16 lines / 1200 chars to keep context compact
-- Thinking blocks and signatures are stripped
-- Session metadata fields (`usage`, `model`, `timestamp`) are preserved for replay
-- Forked runs append the follow-up task directly into the sanitized child session as a normal user turn
-- Non-forked runs launch the follow-up task via `@file` to avoid shell quoting and argv-length issues
-
----
-
-## Model Hints
-
-Model hints let you steer subagents toward the right model family without hardcoding specific model IDs:
+Child sessions can write structured deliverables without dirtying the repository:
 
 ```typescript
-// Frontend work → prefers Claude/Sonnet/Opus family
-subagent({ name: "UI Worker", agent: "worker", modelHint: "frontend", task: "..." })
+write_artifact({
+  name: "context/auth.md",
+  content: "# Auth context\n...",
+})
 
-// Backend work → prefers Codex/GPT family
-subagent({ name: "API Worker", agent: "worker", modelHint: "non-frontend", task: "..." })
+read_artifact({ name: "context/auth.md" })
 ```
 
-Resolution order (`model-hints.ts:resolveHintedModel`):
+Artifacts are stored under:
 
-1. **Explicit `model`** → always wins, hint is informational only
-2. **Agent `model-frontend` / `model-non-frontend` frontmatter** → hint-specific override
-3. **Agent default `model`** → used if it already matches the hinted family
-4. **Package defaults** → `anthropic/claude-sonnet-4-7` (frontend) or `openai-codex/gpt-5.4` (non-frontend)
-
-Accepted aliases: `frontend`, `ui`, `ux`, `design` → `"frontend"` | `non-frontend`, `backend`, `general`, `code`, `coding` → `"non-frontend"`
-
----
-
-## Custom Agents
-
-Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global):
-
-```markdown
----
-name: my-agent
-description: Does something specific
-model: anthropic/claude-sonnet-4-7
-thinking: minimal
-tools: read, bash, edit, write
-spawning: false
----
-
-# My Agent
-
-You are a specialized agent that does X...
-```
-
-The frontmatter configures the agent's defaults. Everything after the `---` fence is the agent's system prompt body — it gets injected into the task message when the agent is spawned.
-
-### Frontmatter Reference
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | string | Agent name (used in `agent: "my-agent"`) |
-| `description` | string | Shown in `subagents_list` output |
-| `model` | string | Default model (e.g. `anthropic/claude-sonnet-4-7`) |
-| `model-frontend` / `frontend-model` | string | Model override when `modelHint: "frontend"` |
-| `model-non-frontend` / `non-frontend-model` | string | Model override when `modelHint: "non-frontend"` |
-| `thinking` | string | Thinking level: `minimal`, `medium`, `high` |
-| `tools` | string | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls` |
-| `skills` | string | Comma-separated skill names to auto-load |
-| `spawning` | boolean | Set `false` to deny all subagent-spawning tools |
-| `deny-tools` | string | Comma-separated extension tool names to deny |
-| `cwd` | string | Default working directory (absolute or relative to project root) |
-
----
-
-## Tool Access Control
-
-Control what tools subagents can access:
-
-### `spawning: false`
-
-Denies all spawning-related tools (`subagent`, `agent_group`, `branch`, `subagents_list`, `active_subagents`):
-
-```yaml
----
-name: worker
-spawning: false
----
-```
-
-### `deny-tools`
-
-Fine-grained control over individual extension tools:
-
-```yaml
----
-name: focused-agent
-deny-tools: subagent, active_subagents
----
-```
-
-Both mechanisms work through the `PI_DENY_TOOLS` environment variable — the parent sets it when launching the child, and the subagent-done extension reads it to filter tool registration.
-
-### Recommended Configuration
-
-| Agent | `spawning` | Rationale |
-|-------|-----------|-----------|
-| planner | *(default/true)* | Legitimately spawns scouts for investigation |
-| worker | `false` | Should implement tasks, not delegate |
-| researcher | `false` | Should research, not spawn |
-| reviewer | `false` | Should review, not spawn |
-| scout | `false` | Should gather context, not spawn |
-
----
-
-## Role Folders
-
-The `cwd` parameter lets sub-agents start in a specific directory with its own configuration:
-
-```
-project/
-├── agents/
-│   ├── game-designer/
-│   │   └── CLAUDE.md          ← "You are a game designer..."
-│   ├── sre/
-│   │   ├── CLAUDE.md          ← "You are an SRE specialist..."
-│   │   └── .pi/skills/        ← SRE-specific skills
-│   └── narrative/
-│       └── CLAUDE.md          ← "You are a narrative designer..."
-```
-
-```typescript
-subagent({ name: "Game Designer", cwd: "agents/game-designer", task: "Design the combat system" })
-subagent({ name: "SRE", cwd: "agents/sre", task: "Review deployment pipeline" })
-```
-
-When `cwd` is set, the pi process starts in that directory and automatically picks up its local `.pi/` config, `CLAUDE.md`, skills, and extensions. Set a default `cwd` in agent frontmatter:
-
-```yaml
----
-name: game-designer
-cwd: ./agents/game-designer
-spawning: false
----
-```
-
----
-
-## Session Artifacts
-
-Subagents communicate structured output through session-scoped artifact files:
-
-```
+```text
 ~/.pi/history/<project>/artifacts/<session-id>/
-├── context.md                    ← scout findings
+```
+
+---
+
+## Depth and recursive fan-out
+
+`depth` is the guardrail that prevents uncontrolled agent trees.
+
+```
+   parent call
+      │
+      ├──▶ track A  depth=0  ──▶ no mapreduce tool visible
+      │
+      └──▶ track B  depth=2  ──▶ may call mapreduce
+                │
+                └──▶ child track depth≤1 ──▶ may call mapreduce at most once more
+```
+
+Depth is a capability budget, not a suggestion.
+
+Enforcement happens in two places:
+
+- **Registration time** — if a child has no remaining depth, the `mapreduce` tool is not registered for that child.
+- **Execution time** — the live depth is re-read before spawning, so stale sessions cannot exceed their budget.
+
+The lineage ledger stores one row per root/child session in SQLite:
+
+```text
+~/.pi/subagents/lineage.db
+```
+
+Depth rules:
+
+| Session | Rule |
+|---------|------|
+| Root session | Treated as unlimited for top-level calls. |
+| Child session | Uses the lower of `PI_SUBAGENT_DEPTH_REMAINING` and its lineage DB row. |
+| Grandchild | Receives `min(requested_depth, parent_remaining - 1, 10)`. |
+| Exhausted child | Does not see `mapreduce`. |
+
+---
+
+## Session forking and context propagation
+
+Every track starts from a sanitized copy of the parent session file.
+
+```
+   parent JSONL ──▶ sanitizer ──▶ child JSONL ──▶ track prompt appended ──▶ pi child
+        │              │              │                    │
+        │              │              │                    └─ track-specific task
+        │              │              └─ replayable conversation context
+        │              └─ trims noisy or unsafe context
+        └─ current session state
+```
+
+The sanitizer keeps enough history for the child to understand the conversation while dropping noise.
+
+| Input | Fork behavior |
+|-------|---------------|
+| Last triggering user message | Dropped, so the child does not see the meta-request that spawned it. |
+| Assistant text | Preserved. |
+| Assistant tool calls | Preserved as stubs with IDs and names, but empty arguments. |
+| Tool results from `mapreduce` and legacy spawning tools | Replaced with `[tool output omitted]`. |
+| Other tool results | Truncated to 16 lines / 1200 chars. |
+| Thinking/signature blocks | Removed. |
+| Session replay metadata | Preserved where needed. |
+
+The forked child then receives a normal user turn containing:
+
+1. continuation instruction,
+2. completion requirements,
+3. the track prompt,
+4. summary instructions.
+
+---
+
+## Completion and result aggregation
+
+Each child session loads `pi-extension/subagents/subagent-done.ts`. That extension registers `subagent_done`, tracks whether the child wrote artifacts, and hard-exits the child process when done.
+
+```
+   child works ──▶ final assistant summary ──▶ subagent_done ──▶ process exits ──▶ sentinel
+```
+
+The final assistant message before `subagent_done` becomes the summary returned to the parent.
+
+Exit detection is intentionally simple. The launched shell command ends with a sentinel:
+
+```bash
+echo '__SUBAGENT_DONE_'$?'__'
+```
+
+The parent polls each pane for that sentinel, then reads the child session file and extracts the last assistant message.
+
+Failure handling is per track:
+
+```
+   launch/watch outcome ──┬──▶ exit 0      : successful section
+                          ├──▶ exit nonzero: failed section
+                          ├──▶ launch error: synthetic failed section
+                          └──▶ watcher err : synthetic failed section
+```
+
+One failed track does not erase sibling results; the reducer still returns all sections.
+
+---
+
+## Model hints
+
+Model hints steer all tracks toward a model family without hardcoding a concrete model ID.
+
+```typescript
+// Frontend or visual work → Claude/Sonnet family.
+mapreduce({ tracks, modelHint: "frontend" })
+
+// Backend/general coding → GPT-5.5 family.
+mapreduce({ tracks, modelHint: "non-frontend" })
+
+// Cheap/quick work → GPT-5.4 Mini family.
+mapreduce({ tracks, modelHint: "fast" })
+
+// Hard reasoning → GPT-5.5 or strongest reasoning family.
+mapreduce({ tracks, modelHint: "reasoning" })
+```
+
+Resolution order:
+
+1. **Explicit `model`** wins.
+2. **Agent/frontmatter defaults** may supply hint-specific overrides when a child is launched with an agent profile.
+3. **Agent default model** is reused if it already matches the hinted family.
+4. **Package defaults** are used otherwise:
+   - `frontend` → `anthropic/claude-sonnet-4-7`
+   - `non-frontend` → `openai-codex/gpt-5.5`
+   - `fast` → `openai-codex/gpt-5.4-mini`
+   - `reasoning` → `openai-codex/gpt-5.5`
+
+Accepted aliases include:
+
+| Canonical hint | Example aliases |
+|----------------|-----------------|
+| `frontend` | `ui`, `ux`, `design`, `visual`, `web`, `mobile` |
+| `non-frontend` | `backend`, `general`, `code`, `api`, `server`, `infra`, `cli` |
+| `fast` | `quick`, `cheap`, `mini`, `small`, `haiku` |
+| `reasoning` | `deep`, `hard`, `complex`, `smart`, `strong`, `opus` |
+
+---
+
+## Session artifacts
+
+Artifacts are the preferred way for tracks to leave structured outputs larger than their final summary.
+
+```
+   track final summary ──▶ short result in mapreduce response
+   write_artifact      ──▶ durable notes under ~/.pi/history/...
+```
+
+Example artifact layout:
+
+```text
+~/.pi/history/<project>/artifacts/<session-id>/
+├── context/
+│   ├── auth.md
+│   └── tests.md
 ├── plans/
-│   └── 2026-04-12-dark-mode.md  ← planner output
-├── review.md                     ← reviewer report
-└── visual-test-report.md         ← visual tester report
+│   └── implementation.md
+└── reviews/
+    └── diff-review.md
 ```
 
-- **`write_artifact`** — Agents write their deliverables here instead of to the project directory
-- **`read_artifact`** — Searches the current session first, then other sessions for the same project (most recently modified first)
-
-This keeps agent working files separate from the project codebase while making them accessible across sessions.
+Use artifacts for plans, reconnaissance, audit notes, and review reports. Use the final assistant summary for the concise result the parent should read immediately.
 
 ---
 
-## Multiplexer Status Integration
+## Status widgets and mux integration
 
-When running inside cmux, the cmux-status extension pushes real-time agent state into the sidebar using `cmux set-status`:
+### Parent mapreduce widget
+
+The parent session shows active mapreduce tracks above the editor:
 
 ```
-┌─────────────────┐
-│ ✓ Idle          │  ← pi_state (green when idle, amber when working)
-│ 🧠 sonnet-4-7   │  ← pi_model
-│ ✨ minimal       │  ← pi_thinking
-│ 📊 45.2k tokens │  ← pi_tokens
-│ 💰 $0.23        │  ← pi_cost
-│ 🔧 bash         │  ← pi_tool (shown during tool execution)
-└─────────────────┘
+╭─ mapreduce ───────────────────────────── 2 running ─╮
+│ 01:23  Fork: API d=1                  15 msgs (12KB) │
+│ 00:45  Fork: UI                         8 msgs (6KB) │
+╰──────────────────────────────────────────────────────╯
 ```
 
-The extension hooks into pi lifecycle events (`session_start`, `agent_start`, `agent_end`, `turn_end`, `model_select`, `tool_execution_start/end`) and fires fire-and-forget `cmux` CLI calls. Errors are silently ignored so cmux issues never affect pi.
+The widget disappears when all tracks finish.
+
+### Child tools widget
+
+Each child session shows its tool set. Toggle with `Ctrl+J`:
+
+```
+[Fork: API] — 18 tools · 1 denied  (Ctrl+J to expand)
+```
+
+Expanded view shows available tools and denied tools.
+
+### cmux sidebar status
+
+When running inside cmux, the status extension pushes pi state to the cmux sidebar:
+
+```text
+pi_state     Idle / Working
+pi_model     active model
+pi_thinking  thinking level
+pi_tokens    token count
+pi_cost      session cost
+pi_tool      active tool name
+```
+
+These updates are best-effort and never block pi.
 
 ---
 
-## Tools Widget
+## Legacy agent definitions
 
-Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle with `Ctrl+J`:
+The repository still includes bundled prompt profiles in `agents/`:
 
-```
-[scout] — 12 tools · 4 denied  (Ctrl+J)              ← collapsed
-[scout] — 12 available  (Ctrl+J to collapse)          ← expanded
-  read, bash, edit, write, todo, ...
-  denied: subagent, subagents_list, ...
-```
+| Agent | Default model | Role |
+|-------|---------------|------|
+| `scout` | `anthropic/claude-haiku-4-5` | Fast read-only codebase reconnaissance. |
+| `worker` | `anthropic/claude-sonnet-4-7` | Focused implementation. |
+| `planner` | `anthropic/claude-opus-4-7` | Planning and todo creation. |
+| `reviewer` | `anthropic/claude-opus-4-7` | Code review. |
+| `visual-tester` | `anthropic/claude-sonnet-4-7` | Visual QA with Chrome CDP. |
+
+These files are retained as reusable role definitions and for compatibility with older session history. The current public orchestration API is `mapreduce`, not the older `agent_group`, `subagent`, `branch`, `/plan`, or `/iterate` interface.
+
+If you need role specialization today, encode it in each track prompt or use `model`/`modelHint` for all tracks in the call.
 
 ---
 
 ## Testing
 
-The test suite covers the non-multiplexer-dependent logic:
+Run the test suite:
 
 ```bash
 node --test test/test.ts
 ```
 
-Tested modules:
-- **`session.ts`** — `getLeafId`, `getEntryCount`, `getNewEntries`, `findLastAssistantMessage`, `appendBranchSummary`, `copySessionFile`, `mergeNewEntries`, `writeSanitizedForkSession`
-- **`model-hints.ts`** — `normalizeModelHint`, `modelMatchesHintFamily`, `resolveHintedModel`
-- **`cmux.ts`** — `shellEscape`, `isCmuxAvailable`
+Covered areas:
+
+- `session.ts` — session entry reading, truncation, fork sanitization, assistant-summary extraction, branch helpers.
+- `model-hints.ts` — hint normalization, family matching, model resolution.
+- `tool-selection.ts` — child tool-list construction and lifecycle-tool preservation.
+- `orchestrate.ts` — ordered results, per-track launch failures, watcher failures, abort propagation.
+- `cmux.ts` — shell escaping and mux backend helpers where testable.
 
 ---
 
 ## Requirements
 
-- [pi](https://github.com/badlogic/pi-mono) — the coding agent
-- One supported multiplexer:
-  - [Supaterm](https://supaterm.com) (preferred — native tab management)
+- [pi](https://github.com/badlogic/pi-mono)
+- Node.js with `node:sqlite` support for lineage tracking
+- One practical mux backend:
+  - [Supaterm](https://supaterm.com) preferred
   - [cmux](https://github.com/manaflow-ai/cmux)
   - [zellij](https://zellij.dev)
+  - GNU screen fallback
+
+Recommended startup:
 
 ```bash
-cmux pi
-# or
-zellij --session pi   # then run: pi
+sp tab new pi
 ```
 
-Optional backend override:
+Backend override:
 
 ```bash
-export PI_SUBAGENT_MUX=cmux   # or supaterm, zellij
+export PI_SUBAGENT_MUX=supaterm
 ```
+
+---
 
 ## License
 

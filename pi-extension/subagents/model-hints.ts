@@ -1,14 +1,18 @@
-export type ModelHint = "frontend" | "non-frontend";
+export type ModelHint = "frontend" | "non-frontend" | "fast" | "reasoning";
 
 export interface AgentModelDefaults {
   model?: string;
   frontendModel?: string;
   nonFrontendModel?: string;
+  fastModel?: string;
+  reasoningModel?: string;
 }
 
 const DEFAULT_HINT_MODELS: Record<ModelHint, string> = {
   frontend: "anthropic/claude-sonnet-4-7",
-  "non-frontend": "openai-codex/gpt-5.4",
+  "non-frontend": "openai-codex/gpt-5.5",
+  fast: "openai-codex/gpt-5.4-mini",
+  reasoning: "openai-codex/gpt-5.5",
 };
 
 const FRONTEND_HINT_ALIASES = new Set([
@@ -18,6 +22,8 @@ const FRONTEND_HINT_ALIASES = new Set([
   "ux",
   "design",
   "visual",
+  "web",
+  "mobile",
 ]);
 const NON_FRONTEND_HINT_ALIASES = new Set([
   "non-frontend",
@@ -28,6 +34,33 @@ const NON_FRONTEND_HINT_ALIASES = new Set([
   "general",
   "code",
   "coding",
+  "api",
+  "server",
+  "runtime",
+  "infra",
+  "cli",
+]);
+const FAST_HINT_ALIASES = new Set([
+  "fast",
+  "quick",
+  "speed",
+  "speedy",
+  "cheap",
+  "mini",
+  "small",
+  "haiku",
+]);
+const REASONING_HINT_ALIASES = new Set([
+  "reasoning",
+  "reason",
+  "deep",
+  "hard",
+  "complex",
+  "smart",
+  "strong",
+  "large",
+  "max",
+  "opus",
 ]);
 
 export function normalizeModelHint(
@@ -37,6 +70,8 @@ export function normalizeModelHint(
   if (!normalized) return undefined;
   if (FRONTEND_HINT_ALIASES.has(normalized)) return "frontend";
   if (NON_FRONTEND_HINT_ALIASES.has(normalized)) return "non-frontend";
+  if (FAST_HINT_ALIASES.has(normalized)) return "fast";
+  if (REASONING_HINT_ALIASES.has(normalized)) return "reasoning";
   return undefined;
 }
 
@@ -49,6 +84,24 @@ export function modelMatchesHintFamily(
 
   if (hint === "frontend") {
     return normalized.includes("anthropic/") || normalized.includes("claude-");
+  }
+
+  if (hint === "fast") {
+    return (
+      normalized.includes("mini") ||
+      normalized.includes("haiku") ||
+      normalized.includes("flash") ||
+      normalized.includes("spark")
+    );
+  }
+
+  if (hint === "reasoning") {
+    return (
+      normalized.includes("gpt-5.5") ||
+      normalized.includes("opus") ||
+      normalized.includes("max") ||
+      normalized.includes("pro")
+    );
   }
 
   return (
@@ -77,7 +130,11 @@ export function resolveHintedModel(input: {
   const hintedOverride =
     modelHint === "frontend"
       ? agentDefaults?.frontendModel
-      : agentDefaults?.nonFrontendModel;
+      : modelHint === "non-frontend"
+        ? agentDefaults?.nonFrontendModel
+        : modelHint === "fast"
+          ? agentDefaults?.fastModel
+          : agentDefaults?.reasoningModel;
 
   if (hintedOverride) {
     return { model: hintedOverride, modelHint };
